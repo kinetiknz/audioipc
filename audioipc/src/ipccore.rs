@@ -650,7 +650,11 @@ pub struct EventLoopThread {
 }
 
 impl EventLoopThread {
-    pub fn new<F1, F2>(
+    pub fn new(name: String, stack_size: Option<usize>) -> Result<Self> {
+        EventLoopThread::new_with_callbacks(name, stack_size, || {}, || {})
+    }
+
+    pub fn new_with_callbacks<F1, F2>(
         name: String,
         stack_size: Option<usize>,
         after_start: F1,
@@ -660,6 +664,7 @@ impl EventLoopThread {
         F1: Fn() + Send + 'static,
         F2: Fn() + Send + 'static,
     {
+        trace!("New EventLoopThread name='{}'", name);
         let mut event_loop = EventLoop::new(name.clone())?;
         let handle = event_loop.handle();
 
@@ -668,15 +673,28 @@ impl EventLoopThread {
             .stack_size(stack_size.unwrap_or(64 * 4096));
 
         let thread = builder.spawn(move || {
+            trace!("EventLoopThread name='{}' started", event_loop.name);
+            #[cfg(feature = "profiler")]
+            gecko_profiler::register_thread(&event_loop.name);
             after_start();
-            let _thread_exit_guard = scopeguard::guard((), |_| before_stop());
 
-            while event_loop.poll()? {
-                trace!("{}: event loop poll", event_loop.name);
-            }
+            let r = loop {
+                match event_loop.poll() {
+                    Ok(true) => continue,
+                    Ok(false) => break Ok(()),
+                    Err(e) => break Err(e),
+                }
+            };
 
-            trace!("{}: event loop shutdown", event_loop.name);
-            Ok(())
+            before_stop();
+            #[cfg(feature = "profiler")]
+            gecko_profiler::unregister_thread();
+            trace!(
+                "EventLoopThread name='{}' stopped, r={:?}",
+                event_loop.name,
+                r
+            );
+            r
         })?;
 
         Ok(EventLoopThread {
@@ -754,8 +772,8 @@ mod test {
         Proxy<TestServerMessage, TestClientMessage>,
     ) {
         // Server setup and registration.
-        let server = EventLoopThread::new("test-server".to_string(), None, || {}, || {})
-            .expect("server EventLoopThread");
+        let server =
+            EventLoopThread::new("test-server".to_string(), None).expect("server EventLoopThread");
         let server_handle = server.handle();
 
         let (server_pipe, client_pipe) = sys::make_pipe_pair().expect("server make_pipe_pair");
@@ -764,8 +782,8 @@ mod test {
             .expect("server bind_server");
 
         // Client setup and registration.
-        let client = EventLoopThread::new("test-client".to_string(), None, || {}, || {})
-            .expect("client EventLoopThread");
+        let client =
+            EventLoopThread::new("test-client".to_string(), None).expect("client EventLoopThread");
         let client_handle = client.handle();
 
         let client_pipe = unsafe { sys::Pipe::from_raw_handle(client_pipe) };
@@ -833,8 +851,8 @@ mod test {
     #[test]
     fn disconnected_handle() {
         init();
-        let server = EventLoopThread::new("test-server".to_string(), None, || {}, || {})
-            .expect("server EventLoopThread");
+        let server =
+            EventLoopThread::new("test-server".to_string(), None).expect("server EventLoopThread");
         let server_handle = server.handle().clone();
         drop(server);
 
@@ -849,7 +867,7 @@ mod test {
         let (start_tx, start_rx) = mpsc::channel();
         let (stop_tx, stop_rx) = mpsc::channel();
 
-        let elt = EventLoopThread::new(
+        let elt = EventLoopThread::new_with_callbacks(
             "test-thread-callbacks".to_string(),
             None,
             move || start_tx.send(()).unwrap(),

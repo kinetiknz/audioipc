@@ -26,6 +26,7 @@ thread_local!(static AUDIOIPC_INIT_PARAMS: std::cell::RefCell<Option<AudioIpcIni
 pub struct AudioIpcInitParams {
     // Fields only need to be public for ipctest.
     pub server_connection: PlatformHandleType,
+    // TODO: `pool_size` is obsolete and will be removed in the near future.
     pub pool_size: usize,
     pub stack_size: usize,
     pub thread_create_callback: Option<extern "C" fn(*const ::std::os::raw::c_char)>,

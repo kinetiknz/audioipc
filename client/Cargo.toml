@@ -9,8 +9,14 @@ license = "ISC"
 description = "Cubeb Backend for talking to remote cubeb server."
 edition = "2018"
 
+[features]
+profiler = ["gecko-profiler", "audioipc/profiler"]
+
 [dependencies]
 audio_thread_priority = "0.23.4"
 audioipc = { package = "audioipc2", path="../audioipc" }
 cubeb-backend = "0.9"
 log = "0.4"
+# This is a workaround for https://github.com/rust-lang/cargo/issues/4544
+# It's replaced with 'path = "../../tools/profiler/rust-api"' in the Gecko build.
+gecko-profiler = { git = "https://github.com/kinetiknz/rust-api", optional = true }

@@ -56,14 +56,14 @@ struct ServerWrapper {
     device_collection_thread: ipccore::EventLoopThread,
 }
 
-fn register_thread(callback: Option<extern "C" fn(*const ::std::os::raw::c_char)>) {
+fn after_start(callback: Option<extern "C" fn(*const ::std::os::raw::c_char)>) {
     if let Some(func) = callback {
         let name = CString::new(thread::current().name().unwrap()).unwrap();
         func(name.as_ptr());
     }
 }
 
-fn unregister_thread(callback: Option<extern "C" fn()>) {
+fn before_stop(callback: Option<extern "C" fn()>) {
     if let Some(func) = callback {
         func();
     }
@@ -74,18 +74,14 @@ fn init_threads(
     thread_destroy_callback: Option<extern "C" fn()>,
 ) -> Result<ServerWrapper> {
     let rpc_name = "AudioIPC Server RPC";
-    let rpc_thread = ipccore::EventLoopThread::new(
+    let rpc_thread = ipccore::EventLoopThread::new_with_callbacks(
         rpc_name.to_string(),
         None,
         move || {
-            trace!("Starting {} thread", rpc_name);
-            register_thread(thread_create_callback);
+            after_start(thread_create_callback);
             audioipc::server_platform_init();
         },
-        move || {
-            unregister_thread(thread_destroy_callback);
-            trace!("Stopping {} thread", rpc_name);
-        },
+        move || before_stop(thread_destroy_callback),
     )
     .map_err(|e| {
         debug!("Failed to start {} thread: {:?}", rpc_name, e);
@@ -93,23 +89,19 @@ fn init_threads(
     })?;
 
     let callback_name = "AudioIPC Server Callback";
-    let callback_thread = ipccore::EventLoopThread::new(
+    let callback_thread = ipccore::EventLoopThread::new_with_callbacks(
         callback_name.to_string(),
         None,
         move || {
-            trace!("Starting {} thread", callback_name);
             if let Err(e) = promote_current_thread_to_real_time(0, 48000) {
                 debug!(
                     "Failed to promote {} thread to real-time: {:?}",
                     callback_name, e
                 );
             }
-            register_thread(thread_create_callback);
+            after_start(thread_create_callback);
         },
-        move || {
-            unregister_thread(thread_destroy_callback);
-            trace!("Stopping {} thread", callback_name);
-        },
+        move || before_stop(thread_destroy_callback),
     )
     .map_err(|e| {
         debug!("Failed to start {} thread: {:?}", callback_name, e);
@@ -117,17 +109,11 @@ fn init_threads(
     })?;
 
     let device_collection_name = "AudioIPC DeviceCollection RPC";
-    let device_collection_thread = ipccore::EventLoopThread::new(
+    let device_collection_thread = ipccore::EventLoopThread::new_with_callbacks(
         device_collection_name.to_string(),
         None,
-        move || {
-            trace!("Starting {} thread", rpc_name);
-            register_thread(thread_create_callback);
-        },
-        move || {
-            unregister_thread(thread_destroy_callback);
-            trace!("Stopping {} thread", rpc_name);
-        },
+        move || after_start(thread_create_callback),
+        move || before_stop(thread_destroy_callback),
     )
     .map_err(|e| {
         debug!("Failed to start {} thread: {:?}", rpc_name, e);

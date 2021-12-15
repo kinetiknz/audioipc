@@ -92,7 +92,7 @@ fn promote_thread(_rpc: &rpccore::Proxy<ServerMessage, ClientMessage>) {
     }
 }
 
-fn register_thread(callback: Option<extern "C" fn(*const ::std::os::raw::c_char)>) {
+fn after_start(callback: Option<extern "C" fn(*const ::std::os::raw::c_char)>) {
     if let Some(func) = callback {
         let thr = thread::current();
         let name = CString::new(thr.name().unwrap()).unwrap();
@@ -100,18 +100,10 @@ fn register_thread(callback: Option<extern "C" fn(*const ::std::os::raw::c_char)
     }
 }
 
-fn unregister_thread(callback: Option<extern "C" fn()>) {
+fn before_stop(callback: Option<extern "C" fn()>) {
     if let Some(func) = callback {
         func();
     }
-}
-
-fn promote_and_register_thread(
-    rpc: &rpccore::Proxy<ServerMessage, ClientMessage>,
-    callback: Option<extern "C" fn(*const ::std::os::raw::c_char)>,
-) {
-    promote_thread(rpc);
-    register_thread(callback);
 }
 
 #[derive(Default)]
@@ -176,18 +168,17 @@ impl ContextOps for ClientContext {
         let server_connection =
             unsafe { sys::Pipe::from_raw_handle(PlatformHandle::new(params.server_connection)) };
 
-        let rpc_thread = ipccore::EventLoopThread::new(
+        let rpc_thread = ipccore::EventLoopThread::new_with_callbacks(
             "AudioIPC Client RPC".to_string(),
             None,
-            move || register_thread(thread_create_callback),
-            move || unregister_thread(thread_destroy_callback),
+            move || after_start(thread_create_callback),
+            move || before_stop(thread_destroy_callback),
         )
         .map_err(|_| Error::default())?;
         let rpc = rpc_thread
             .handle()
             .bind_client::<CubebClient>(server_connection)
             .map_err(|_| Error::default())?;
-        let rpc2 = rpc.clone();
 
         // Don't let errors bubble from here.  Later calls against this context
         // will return errors the caller expects to handle.
@@ -198,11 +189,16 @@ impl ContextOps for ClientContext {
         let backend_id = CString::new(backend_id).expect("backend_id query failed");
 
         // TODO: remove params.pool_size from init params.
-        let callback_thread = ipccore::EventLoopThread::new(
+        assert_eq!(params.pool_size, 1);
+        let rpc2 = rpc.clone();
+        let callback_thread = ipccore::EventLoopThread::new_with_callbacks(
             "AudioIPC Client Callback".to_string(),
             Some(params.stack_size),
-            move || promote_and_register_thread(&rpc2, thread_create_callback),
-            move || unregister_thread(thread_destroy_callback),
+            move || {
+                after_start(thread_create_callback);
+                promote_thread(&rpc2);
+            },
+            move || before_stop(thread_destroy_callback),
         )
         .map_err(|_| Error::default())?;
 
