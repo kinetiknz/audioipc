@@ -9,6 +9,9 @@
 extern crate error_chain;
 #[macro_use]
 extern crate log;
+#[cfg(feature = "profiler")]
+#[macro_use]
+extern crate gecko_profiler;
 
 pub mod codec;
 #[allow(deprecated)]

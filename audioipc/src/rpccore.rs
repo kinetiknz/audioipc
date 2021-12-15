@@ -129,6 +129,7 @@ impl<C: Client> Handler for ClientHandler<C> {
     type In = C::ClientMessage;
     type Out = C::ServerMessage;
 
+    #[cfg_attr(feature = "profiler", gecko_profiler_fn_label(Media, CUBEB))]
     fn consume(&mut self, response: Self::In) -> Result<()> {
         trace!("ClientHandler::consume");
         if let Some(complete) = self.in_flight.pop_front() {
@@ -143,6 +144,7 @@ impl<C: Client> Handler for ClientHandler<C> {
         Ok(())
     }
 
+    #[cfg_attr(feature = "profiler", gecko_profiler_fn_label(Media, CUBEB))]
     fn produce(&mut self) -> Result<Option<Self::Out>> {
         trace!("ClientHandler::produce");
 
@@ -199,6 +201,7 @@ impl<S: Server> Handler for ServerHandler<S> {
     type In = S::ServerMessage;
     type Out = S::ClientMessage;
 
+    #[cfg_attr(feature = "profiler", gecko_profiler_fn_label(Media, CUBEB))]
     fn consume(&mut self, message: Self::In) -> Result<()> {
         trace!("ServerHandler::consume");
         let response = self.server.process(message);
@@ -206,6 +209,7 @@ impl<S: Server> Handler for ServerHandler<S> {
         Ok(())
     }
 
+    #[cfg_attr(feature = "profiler", gecko_profiler_fn_label(Media, CUBEB))]
     fn produce(&mut self) -> Result<Option<Self::Out>> {
         trace!("ServerHandler::produce");
 
