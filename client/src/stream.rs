@@ -291,7 +291,7 @@ impl<'ctx> ClientStream<'ctx> {
         };
 
         let (wait_tx, wait_rx) = mpsc::channel();
-        ctx.handle()
+        ctx.callback_handle()
             .spawn(futures::future::lazy(move || {
                 let handle = reactor::Handle::default();
                 let stream = stream.into_tokio_ipc(&handle).unwrap();

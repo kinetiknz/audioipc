@@ -22,7 +22,7 @@ use cubeb_backend::{
     Stream, StreamParams, StreamParamsRef,
 };
 use futures::Future;
-use futures_cpupool::{CpuFuture, CpuPool};
+use futures_cpupool::CpuPool;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 use std::sync::mpsc;
@@ -50,6 +50,7 @@ pub struct ClientContext {
     _ops: *const Ops,
     rpc: rpc::ClientProxy<ServerMessage, ClientMessage>,
     core: core::CoreThread,
+    callback_thread: core::CoreThread,
     cpu_pool: CpuPool,
     backend_id: CString,
     device_collection_rpc: bool,
@@ -61,6 +62,11 @@ impl ClientContext {
     #[doc(hidden)]
     pub fn handle(&self) -> current_thread::Handle {
         self.core.handle()
+    }
+
+    #[doc(hidden)]
+    pub fn callback_handle(&self) -> current_thread::Handle {
+        self.callback_thread.handle()
     }
 
     #[doc(hidden)]
@@ -131,13 +137,12 @@ struct DeviceCollectionCallback {
 struct DeviceCollectionServer {
     input_device_callback: Arc<Mutex<DeviceCollectionCallback>>,
     output_device_callback: Arc<Mutex<DeviceCollectionCallback>>,
-    cpu_pool: CpuPool,
 }
 
 impl rpc::Server for DeviceCollectionServer {
     type Request = DeviceCollectionReq;
     type Response = DeviceCollectionResp;
-    type Future = CpuFuture<Self::Response, ()>;
+    type Future = futures::future::FutureResult<Self::Response, ()>;
     type Transport =
         Framed<audioipc::AsyncMessageStream, LengthDelimitedCodec<Self::Response, Self::Request>>;
 
@@ -160,22 +165,18 @@ impl rpc::Server for DeviceCollectionServer {
                     (dcb.cb, dcb.user_ptr)
                 };
 
-                self.cpu_pool.spawn_fn(move || {
-                    run_in_callback(|| {
-                        if devtype.contains(cubeb_backend::DeviceType::INPUT) {
-                            unsafe {
-                                input_cb.unwrap()(ptr::null_mut(), input_user_ptr as *mut c_void)
-                            }
+                run_in_callback(|| {
+                    if devtype.contains(cubeb_backend::DeviceType::INPUT) {
+                        unsafe { input_cb.unwrap()(ptr::null_mut(), input_user_ptr as *mut c_void) }
+                    }
+                    if devtype.contains(cubeb_backend::DeviceType::OUTPUT) {
+                        unsafe {
+                            output_cb.unwrap()(ptr::null_mut(), output_user_ptr as *mut c_void)
                         }
-                        if devtype.contains(cubeb_backend::DeviceType::OUTPUT) {
-                            unsafe {
-                                output_cb.unwrap()(ptr::null_mut(), output_user_ptr as *mut c_void)
-                            }
-                        }
-                    });
+                    }
+                });
 
-                    Ok(DeviceCollectionResp::DeviceChange)
-                })
+                futures::future::ok(DeviceCollectionResp::DeviceChange)
             }
         }
     }
@@ -221,7 +222,8 @@ impl ContextOps for ClientContext {
         .map_err(|_| Error::default())?;
 
         let rpc = rx_rpc.recv().map_err(|_| Error::default())?;
-        let rpc2 = rpc.clone();
+        let rpc_cb_setup = rpc.clone();
+        let rpc_pool_setup = rpc.clone();
 
         // Don't let errors bubble from here.  Later calls against this context
         // will return errors the caller expects to handle.
@@ -231,9 +233,21 @@ impl ContextOps for ClientContext {
             .unwrap_or_else(|_| "(remote error)".to_string());
         let backend_id = CString::new(backend_id).expect("backend_id query failed");
 
+        let callback_thread = core::spawn_thread(
+            "AudioIPC Client Callback",
+            move || {
+                promote_and_register_thread(&rpc_cb_setup, thread_create_callback);
+                Ok(())
+            },
+            move || unregister_thread(thread_destroy_callback),
+        )
+        .map_err(|_| Error::default())?;
+
         let cpu_pool = futures_cpupool::Builder::new()
             .name_prefix("AudioIPC")
-            .after_start(move || promote_and_register_thread(&rpc2, thread_create_callback))
+            .after_start(move || {
+                promote_and_register_thread(&rpc_pool_setup, thread_create_callback)
+            })
             .before_stop(move || unregister_thread(thread_destroy_callback))
             .pool_size(params.pool_size)
             .stack_size(params.stack_size)
@@ -243,6 +257,7 @@ impl ContextOps for ClientContext {
             _ops: &CLIENT_OPS as *const _,
             rpc,
             core,
+            callback_thread,
             cpu_pool,
             backend_id,
             device_collection_rpc: false,
@@ -378,7 +393,6 @@ impl ContextOps for ClientContext {
             let server = DeviceCollectionServer {
                 input_device_callback: self.input_device_callback.clone(),
                 output_device_callback: self.output_device_callback.clone(),
-                cpu_pool: self.cpu_pool(),
             };
 
             let (wait_tx, wait_rx) = mpsc::channel();
