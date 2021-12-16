@@ -57,6 +57,7 @@ use crate::errors::*;
 struct ServerWrapper {
     core_thread: core::CoreThread,
     callback_thread: core::CoreThread,
+    device_collection_thread: core::CoreThread,
 }
 
 fn register_thread(callback: Option<extern "C" fn(*const ::std::os::raw::c_char)>) {
@@ -120,9 +121,28 @@ fn init_threads(
         e
     })?;
 
+    let device_collection_thread = core::spawn_thread(
+        "AudioIPC DeviceCollection RPC",
+        move || {
+            register_thread(thread_create_callback);
+            Ok(())
+        },
+        move || {
+            unregister_thread(thread_destroy_callback);
+        },
+    )
+    .map_err(|e| {
+        debug!(
+            "Failed to cubeb audio device collection event loop thread: {:?}",
+            e
+        );
+        e
+    })?;
+
     Ok(ServerWrapper {
         core_thread,
         callback_thread,
+        device_collection_thread,
     })
 }
 
@@ -170,6 +190,7 @@ pub extern "C" fn audioipc_server_new_client(
     let wrapper: &ServerWrapper = unsafe { &*(p as *mut _) };
 
     let callback_thread_handle = wrapper.callback_thread.handle();
+    let device_collection_handle = wrapper.device_collection_thread.handle();
 
     // We create a connected pair of anonymous IPC endpoints. One side
     // is registered with the reactor core, the other side is returned
@@ -187,7 +208,7 @@ pub extern "C" fn audioipc_server_new_client(
                     ipc_server.into_tokio_ipc(&handle)
                     .map(|sock| {
                         let transport = framed(sock, Default::default());
-                        rpc::bind_server(transport, server::CubebServer::new(callback_thread_handle, shm_area_size));
+                        rpc::bind_server(transport, server::CubebServer::new(callback_thread_handle, device_collection_handle, shm_area_size));
                     }).map_err(|_| ())
                     // Notify waiting thread that server has been registered.
                     .and_then(|_| wait_tx.send(()))
