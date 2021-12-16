@@ -17,6 +17,7 @@ futures = "0.1.29"
 log = "0.4"
 serde = "1"
 serde_derive = "1"
+serde_bytes = "0.11"
 tokio = "0.1"
 tokio-io = "0.1"
 audio_thread_priority = "0.23.4"
@@ -44,3 +45,11 @@ default-features = false
 
 [build-dependencies]
 cc = "1.0"
+
+[dev-dependencies]
+criterion = { version = "0.3", features = ["html_reports"] }
+
+[[bench]]
+name = "serialization"
+harness = false
+
