@@ -22,7 +22,6 @@ use cubeb_backend::{
     Stream, StreamParams, StreamParamsRef,
 };
 use futures::Future;
-use futures_cpupool::CpuPool;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 use std::sync::mpsc;
@@ -51,7 +50,6 @@ pub struct ClientContext {
     rpc: rpc::ClientProxy<ServerMessage, ClientMessage>,
     core: core::CoreThread,
     callback_thread: core::CoreThread,
-    cpu_pool: CpuPool,
     backend_id: CString,
     device_collection_rpc: bool,
     input_device_callback: Arc<Mutex<DeviceCollectionCallback>>,
@@ -72,11 +70,6 @@ impl ClientContext {
     #[doc(hidden)]
     pub fn rpc(&self) -> rpc::ClientProxy<ServerMessage, ClientMessage> {
         self.rpc.clone()
-    }
-
-    #[doc(hidden)]
-    pub fn cpu_pool(&self) -> CpuPool {
-        self.cpu_pool.clone()
     }
 }
 
@@ -223,7 +216,6 @@ impl ContextOps for ClientContext {
 
         let rpc = rx_rpc.recv().map_err(|_| Error::default())?;
         let rpc_cb_setup = rpc.clone();
-        let rpc_pool_setup = rpc.clone();
 
         // Don't let errors bubble from here.  Later calls against this context
         // will return errors the caller expects to handle.
@@ -233,6 +225,7 @@ impl ContextOps for ClientContext {
             .unwrap_or_else(|_| "(remote error)".to_string());
         let backend_id = CString::new(backend_id).expect("backend_id query failed");
 
+        assert_eq!(params.pool_size, 1);
         let callback_thread = core::spawn_thread(
             "AudioIPC Client Callback",
             move || {
@@ -243,22 +236,11 @@ impl ContextOps for ClientContext {
         )
         .map_err(|_| Error::default())?;
 
-        let cpu_pool = futures_cpupool::Builder::new()
-            .name_prefix("AudioIPC")
-            .after_start(move || {
-                promote_and_register_thread(&rpc_pool_setup, thread_create_callback)
-            })
-            .before_stop(move || unregister_thread(thread_destroy_callback))
-            .pool_size(params.pool_size)
-            .stack_size(params.stack_size)
-            .create();
-
         let ctx = Box::new(ClientContext {
             _ops: &CLIENT_OPS as *const _,
             rpc,
             core,
             callback_thread,
-            cpu_pool,
             backend_id,
             device_collection_rpc: false,
             input_device_callback: Arc::new(Mutex::new(Default::default())),
@@ -441,7 +423,6 @@ impl fmt::Debug for ClientContext {
             .field("_ops", &self._ops)
             .field("rpc", &self.rpc)
             .field("core", &self.core)
-            .field("cpu_pool", &"...")
             .finish()
     }
 }

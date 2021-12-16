@@ -14,7 +14,6 @@ use audioipc::{
 };
 use cubeb_backend::{ffi, DeviceRef, Error, Result, Stream, StreamOps};
 use futures::Future;
-use futures_cpupool::{CpuFuture, CpuPool};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 use std::ptr;
@@ -66,7 +65,6 @@ struct CallbackServer {
     data_cb: ffi::cubeb_data_callback,
     state_cb: ffi::cubeb_state_callback,
     user_ptr: usize,
-    cpu_pool: CpuPool,
     device_change_cb: Arc<Mutex<ffi::cubeb_device_changed_callback>>,
     // Signals ClientStream that CallbackServer has dropped.
     _shutdown_tx: mpsc::Sender<()>,
@@ -75,7 +73,7 @@ struct CallbackServer {
 impl rpc::Server for CallbackServer {
     type Request = CallbackReq;
     type Response = CallbackResp;
-    type Future = CpuFuture<Self::Response, ()>;
+    type Future = futures::future::FutureResult<Self::Response, ()>;
     type Transport =
         Framed<audioipc::AsyncMessageStream, LengthDelimitedCodec<Self::Response, Self::Request>>;
 
@@ -112,89 +110,83 @@ impl rpc::Server for CallbackServer {
                 let cb = self.data_cb.unwrap();
                 let dir = self.dir;
 
-                self.cpu_pool.spawn_fn(move || {
-                    // Input and output reuse the same shmem backing.  Unfortunately, cubeb's data_callback isn't
-                    // specified in such a way that would require the callee to consume all of the input before
-                    // writing to the output (i.e., it is passed as two pointers that aren't expected to alias).
-                    // That means we need to copy the input here.
-                    let (input_ptr, output_ptr) = match dir {
-                        StreamDirection::Duplex => unsafe {
-                            assert!(input_frame_size > 0);
-                            assert!(output_frame_size > 0);
-                            assert_ne!(duplex_copy_ptr, 0);
-                            let input = shm.get_slice(input_nbytes).unwrap();
-                            ptr::copy_nonoverlapping(
-                                input.as_ptr(),
-                                duplex_copy_ptr as *mut _,
-                                input.len(),
-                            );
-                            (
-                                duplex_copy_ptr as _,
-                                shm.get_mut_slice(output_nbytes).unwrap().as_mut_ptr(),
-                            )
-                        },
-                        StreamDirection::Input => unsafe {
-                            assert!(input_frame_size > 0);
-                            assert_eq!(output_frame_size, 0);
-                            (
-                                shm.get_slice(input_nbytes).unwrap().as_ptr(),
-                                ptr::null_mut(),
-                            )
-                        },
-                        StreamDirection::Output => unsafe {
-                            assert!(output_frame_size > 0);
-                            assert_eq!(input_frame_size, 0);
-                            (
-                                ptr::null(),
-                                shm.get_mut_slice(output_nbytes).unwrap().as_mut_ptr(),
-                            )
-                        },
+                // Input and output reuse the same shmem backing.  Unfortunately, cubeb's data_callback isn't
+                // specified in such a way that would require the callee to consume all of the input before
+                // writing to the output (i.e., it is passed as two pointers that aren't expected to alias).
+                // That means we need to copy the input here.
+                let (input_ptr, output_ptr) = match dir {
+                    StreamDirection::Duplex => unsafe {
+                        assert!(input_frame_size > 0);
+                        assert!(output_frame_size > 0);
+                        assert_ne!(duplex_copy_ptr, 0);
+                        let input = shm.get_slice(input_nbytes).unwrap();
+                        ptr::copy_nonoverlapping(
+                            input.as_ptr(),
+                            duplex_copy_ptr as *mut _,
+                            input.len(),
+                        );
+                        (
+                            duplex_copy_ptr as _,
+                            shm.get_mut_slice(output_nbytes).unwrap().as_mut_ptr(),
+                        )
+                    },
+                    StreamDirection::Input => unsafe {
+                        assert!(input_frame_size > 0);
+                        assert_eq!(output_frame_size, 0);
+                        (
+                            shm.get_slice(input_nbytes).unwrap().as_ptr(),
+                            ptr::null_mut(),
+                        )
+                    },
+                    StreamDirection::Output => unsafe {
+                        assert!(output_frame_size > 0);
+                        assert_eq!(input_frame_size, 0);
+                        (
+                            ptr::null(),
+                            shm.get_mut_slice(output_nbytes).unwrap().as_mut_ptr(),
+                        )
+                    },
+                };
+
+                run_in_callback(|| {
+                    let nframes = unsafe {
+                        cb(
+                            ptr::null_mut(), // https://github.com/kinetiknz/cubeb/issues/518
+                            user_ptr as *mut c_void,
+                            input_ptr as *const _,
+                            output_ptr as *mut _,
+                            nframes as _,
+                        )
                     };
 
-                    run_in_callback(|| {
-                        let nframes = unsafe {
-                            cb(
-                                ptr::null_mut(), // https://github.com/kinetiknz/cubeb/issues/518
-                                user_ptr as *mut c_void,
-                                input_ptr as *const _,
-                                output_ptr as *mut _,
-                                nframes as _,
-                            )
-                        };
-
-                        Ok(CallbackResp::Data(nframes as isize))
-                    })
+                    futures::future::ok(CallbackResp::Data(nframes as isize))
                 })
             }
             CallbackReq::State(state) => {
                 trace!("stream_thread: State Callback: {:?}", state);
                 let user_ptr = self.user_ptr;
                 let cb = self.state_cb.unwrap();
-                self.cpu_pool.spawn_fn(move || {
-                    run_in_callback(|| unsafe {
-                        cb(ptr::null_mut(), user_ptr as *mut _, state);
-                    });
+                run_in_callback(|| unsafe {
+                    cb(ptr::null_mut(), user_ptr as *mut _, state);
+                });
 
-                    Ok(CallbackResp::State)
-                })
+                futures::future::ok(CallbackResp::State)
             }
             CallbackReq::DeviceChange => {
                 let cb = self.device_change_cb.clone();
                 let user_ptr = self.user_ptr;
-                self.cpu_pool.spawn_fn(move || {
-                    run_in_callback(|| {
-                        let cb = cb.lock().unwrap();
-                        if let Some(cb) = *cb {
-                            unsafe {
-                                cb(user_ptr as *mut _);
-                            }
-                        } else {
-                            warn!("DeviceChange received with null callback");
+                run_in_callback(|| {
+                    let cb = cb.lock().unwrap();
+                    if let Some(cb) = *cb {
+                        unsafe {
+                            cb(user_ptr as *mut _);
                         }
-                    });
+                    } else {
+                        warn!("DeviceChange received with null callback");
+                    }
+                });
 
-                    Ok(CallbackResp::DeviceChange)
-                })
+                futures::future::ok(CallbackResp::DeviceChange)
             }
             CallbackReq::SharedMem(mut handle, shm_area_size) => {
                 self.shm = match unsafe { SharedMem::from(handle.take_handle(), shm_area_size) } {
@@ -204,9 +196,7 @@ impl rpc::Server for CallbackServer {
                             "sharedmem client mapping failed (size={}, err={:?})",
                             shm_area_size, e
                         );
-                        return self
-                            .cpu_pool
-                            .spawn_fn(move || Ok(CallbackResp::Error(ffi::CUBEB_ERROR)));
+                        return futures::future::ok(CallbackResp::Error(ffi::CUBEB_ERROR));
                     }
                 };
 
@@ -219,15 +209,13 @@ impl rpc::Server for CallbackServer {
                                 "duplex_input allocation failed (size={}, err={:?})",
                                 shm_area_size, e
                             );
-                            return self
-                                .cpu_pool
-                                .spawn_fn(move || Ok(CallbackResp::Error(ffi::CUBEB_ERROR)));
+                            return futures::future::ok(CallbackResp::Error(ffi::CUBEB_ERROR));
                         }
                     }
                 } else {
                     None
                 };
-                self.cpu_pool.spawn_fn(move || Ok(CallbackResp::SharedMem))
+                futures::future::ok(CallbackResp::SharedMem)
             }
         }
     }
@@ -261,8 +249,6 @@ impl<'ctx> ClientStream<'ctx> {
 
         let user_data = user_ptr as usize;
 
-        let cpu_pool = ctx.cpu_pool();
-
         let null_cb: ffi::cubeb_device_changed_callback = None;
         let device_change_cb = Arc::new(Mutex::new(null_cb));
 
@@ -285,7 +271,6 @@ impl<'ctx> ClientStream<'ctx> {
             data_cb: data_callback,
             state_cb: state_callback,
             user_ptr: user_data,
-            cpu_pool,
             device_change_cb: device_change_cb.clone(),
             _shutdown_tx,
         };
