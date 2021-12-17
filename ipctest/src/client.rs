@@ -4,6 +4,7 @@
 // accompanying file LICENSE for details.
 
 use cubeb::{self, ffi, Sample};
+use std::convert::TryInto;
 use std::f32::consts::PI;
 use std::ffi::CString;
 use std::ptr;
@@ -28,7 +29,7 @@ const STREAM_FORMAT: cubeb::SampleFormat = cubeb::SampleFormat::S16LE;
 
 type Frame = cubeb::MonoFrame<i16>;
 
-fn print_device_info(info: &cubeb::DeviceInfo) {
+fn _print_device_info(info: &cubeb::DeviceInfo) {
     let devtype = if info.device_type().contains(cubeb::DeviceType::INPUT) {
         "input"
     } else if info.device_type().contains(cubeb::DeviceType::OUTPUT) {
@@ -104,7 +105,7 @@ fn print_device_info(info: &cubeb::DeviceInfo) {
     );
 }
 
-fn enumerate_devices(ctx: &cubeb::Context) -> Result<()> {
+fn _enumerate_devices(ctx: &cubeb::Context) -> Result<()> {
     let devices = match ctx.enumerate_devices(cubeb::DeviceType::INPUT) {
         Ok(devices) => devices,
         Err(e) if e.code() == cubeb::ErrorCode::NotSupported => {
@@ -118,7 +119,7 @@ fn enumerate_devices(ctx: &cubeb::Context) -> Result<()> {
 
     println!("Found {} input devices", devices.len());
     for d in devices.iter() {
-        print_device_info(d);
+        _print_device_info(d);
     }
 
     println!(
@@ -135,7 +136,7 @@ fn enumerate_devices(ctx: &cubeb::Context) -> Result<()> {
 
     println!("Found {} output devices", devices.len());
     for d in devices.iter() {
-        print_device_info(d);
+        _print_device_info(d);
     }
 
     Ok(())
@@ -186,7 +187,7 @@ pub fn client_test(handle: audioipc::PlatformHandleType) -> Result<()> {
     println!("Min Latency: {}", latency);
     println!("Preferred Rate: {}", rate);
 
-    enumerate_devices(&ctx)?;
+    //enumerate_devices(&ctx)?;
 
     let params = cubeb::StreamParamsBuilder::new()
         .format(STREAM_FORMAT)
@@ -197,6 +198,7 @@ pub fn client_test(handle: audioipc::PlatformHandleType) -> Result<()> {
 
     let mut position = 0u32;
 
+    let mut now_cb = std::time::Instant::now();
     let mut builder = cubeb::StreamBuilder::<Frame>::new();
     builder
         .name("Cubeb tone (mono)")
@@ -213,17 +215,59 @@ pub fn client_test(handle: audioipc::PlatformHandleType) -> Result<()> {
 
                 position += 1;
             }
-
+            eprintln!("data_callback {} us", now_cb.elapsed().as_micros());
+            now_cb = std::time::Instant::now();
             output.len() as isize
         })
         .state_callback(|state| println!("stream {:?}", state));
 
+    let now = std::time::Instant::now();
     let stream = query!(builder.init(&ctx));
+    eprintln!("stream_init {} us", now.elapsed().as_micros());
 
+    let now = std::time::Instant::now();
     query!(stream.set_volume(1.0));
+    eprintln!("set_volume {} us", now.elapsed().as_micros());
+    let now = std::time::Instant::now();
     query!(stream.start());
-    thread::sleep(Duration::from_millis(500));
+    eprintln!("start {} us", now.elapsed().as_micros());
+
+    let mut histogram = histogram::Histogram::new();
+
+    let fps = 30;
+    let sleep = 1000000 / fps;
+    let steps = (5 * 1000000) / sleep;
+    for _ in 0..steps {
+        let now = std::time::Instant::now();
+        for _ in 0..1 {
+            query!(stream.position());
+        }
+        let us = now.elapsed().as_micros().try_into().unwrap();
+        histogram.increment(us).unwrap();
+        thread::sleep(Duration::from_micros(sleep - us));
+    }
+
     query!(stream.stop());
+
+    // print percentiles from the histogram
+    println!(
+        "\nPercentiles ({} fps): p50: {} us, p90: {} us, p99: {} us, p999: {} us",
+        fps,
+        histogram.percentile(50.0).unwrap(),
+        histogram.percentile(90.0).unwrap(),
+        histogram.percentile(99.0).unwrap(),
+        histogram.percentile(99.9).unwrap(),
+    );
+
+    // print additional statistics
+    println!(
+        "Latency ({} fps): Min: {} us, Avg: {} us, Max: {} us, StdDev: {} us\n",
+        fps,
+        histogram.minimum().unwrap(),
+        histogram.mean().unwrap(),
+        histogram.maximum().unwrap(),
+        histogram.stddev().unwrap(),
+    );
 
     Ok(())
 }
