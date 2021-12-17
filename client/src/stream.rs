@@ -15,11 +15,16 @@ use audioipc::{
 use cubeb_backend::{ffi, DeviceRef, Error, Result, Stream, StreamOps};
 use futures::Future;
 use futures_cpupool::{CpuFuture, CpuPool};
+use std::convert::TryInto;
 use std::ffi::{CStr, CString};
-use std::os::raw::c_void;
 use std::ptr;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use std::{
+    os::raw::c_void,
+    sync::atomic::{AtomicU64, Ordering},
+};
 use tokio::reactor;
 
 pub struct Device(ffi::cubeb_device);
@@ -50,6 +55,10 @@ pub struct ClientStream<'ctx> {
     device_change_cb: Arc<Mutex<ffi::cubeb_device_changed_callback>>,
     // Signals ClientStream that CallbackServer has dropped.
     shutdown_rx: mpsc::Receiver<()>,
+    stream_output_rate: Option<u32>,
+    cached_position: Option<(u64, Instant)>,
+    last_position: u64,
+    write_position: Arc<AtomicU64>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -63,6 +72,7 @@ struct CallbackServer {
     dir: StreamDirection,
     shm: Option<SharedMem>,
     duplex_input: Option<Vec<u8>>,
+    write_position: Arc<AtomicU64>,
     data_cb: ffi::cubeb_data_callback,
     state_cb: ffi::cubeb_state_callback,
     user_ptr: usize,
@@ -111,6 +121,7 @@ impl rpc::Server for CallbackServer {
                 let user_ptr = self.user_ptr;
                 let cb = self.data_cb.unwrap();
                 let dir = self.dir;
+                let write_position = self.write_position.clone();
 
                 self.cpu_pool.spawn_fn(move || {
                     // Input and output reuse the same shmem backing.  Unfortunately, cubeb's data_callback isn't
@@ -161,6 +172,10 @@ impl rpc::Server for CallbackServer {
                                 nframes as _,
                             )
                         };
+                        if nframes > 0 {
+                            write_position
+                                .fetch_add(nframes as u64, std::sync::atomic::Ordering::Relaxed);
+                        }
 
                         Ok(CallbackResp::Data(nframes as isize))
                     })
@@ -244,6 +259,7 @@ impl<'ctx> ClientStream<'ctx> {
         assert_not_in_callback();
 
         let rpc = ctx.rpc();
+        let stream_output_rate = init_params.output_stream_params.map(|p| p.rate);
         let create_params = StreamCreateParams {
             input_stream_params: init_params.input_stream_params,
             output_stream_params: init_params.output_stream_params,
@@ -277,6 +293,7 @@ impl<'ctx> ClientStream<'ctx> {
             (None, Some(_)) => StreamDirection::Output,
             (None, None) => unreachable!(),
         };
+        let write_position = Arc::new(AtomicU64::new(0));
 
         let server = CallbackServer {
             dir,
@@ -287,6 +304,7 @@ impl<'ctx> ClientStream<'ctx> {
             user_ptr: user_data,
             cpu_pool,
             device_change_cb: device_change_cb.clone(),
+            write_position: write_position.clone(),
             _shutdown_tx,
         };
 
@@ -311,6 +329,10 @@ impl<'ctx> ClientStream<'ctx> {
             token: data.token,
             device_change_cb,
             shutdown_rx,
+            stream_output_rate,
+            cached_position: None,
+            last_position: 0,
+            write_position,
         }));
         Ok(unsafe { Stream::from_ptr(stream as *mut _) })
     }
@@ -347,8 +369,41 @@ impl<'ctx> StreamOps for ClientStream<'ctx> {
 
     fn position(&mut self) -> Result<u64> {
         assert_not_in_callback();
-        let rpc = self.context.rpc();
-        send_recv!(rpc, StreamGetPosition(self.token) => StreamPosition())
+
+        let need_cache_update = || {
+            self.cached_position.map_or(true, |(_, last_time)| {
+                last_time.elapsed() >= self.context.position_cache_lifetime()
+            })
+        };
+
+        if need_cache_update() {
+            let rpc = self.context.rpc();
+            let current_pos = send_recv!(rpc, StreamGetPosition(self.token) => StreamPosition())?;
+            self.cached_position = Some((current_pos, Instant::now()));
+        }
+
+        let (cached_pos, cached_time) = self.cached_position.unwrap();
+
+        // If the postion_cache is disabled, return position without interpolation.
+        if self.context.position_cache_lifetime().is_zero() {
+            return Ok(cached_pos);
+        }
+
+        let elapsed_us: u64 = cached_time.elapsed().as_micros().try_into().unwrap();
+        let current_pos =
+            cached_pos + (elapsed_us * self.stream_output_rate.unwrap() as u64 / 1_000_000);
+        let current_pos = current_pos.min(self.write_position.load(Ordering::Relaxed));
+        if self.last_position > current_pos {
+            trace!(
+                "stream position went backward: last={} cur={}",
+                self.last_position,
+                current_pos
+            );
+            self.cached_position = None;
+            return Ok(self.last_position);
+        }
+        self.last_position = current_pos;
+        Ok(current_pos)
     }
 
     fn latency(&mut self) -> Result<u32> {

@@ -159,6 +159,7 @@ pub fn client_test(handle: audioipc::PlatformHandleType) -> Result<()> {
         stack_size: 64 * 1024,
         thread_create_callback: None,
         thread_destroy_callback: None,
+        position_cache_lifetime_ms: 40,
     };
     if unsafe { audioipc_client::audioipc_client_init(&mut c, context_name.as_ptr(), &init_params) }
         < 0

@@ -55,6 +55,7 @@ pub struct ClientContext {
     device_collection_rpc: bool,
     input_device_callback: Arc<Mutex<DeviceCollectionCallback>>,
     output_device_callback: Arc<Mutex<DeviceCollectionCallback>>,
+    position_cache_lifetime: std::time::Duration,
 }
 
 impl ClientContext {
@@ -71,6 +72,11 @@ impl ClientContext {
     #[doc(hidden)]
     pub fn cpu_pool(&self) -> CpuPool {
         self.cpu_pool.clone()
+    }
+
+    #[doc(hidden)]
+    pub fn position_cache_lifetime(&self) -> std::time::Duration {
+        self.position_cache_lifetime
     }
 }
 
@@ -201,6 +207,8 @@ impl ContextOps for ClientContext {
         let params = AUDIOIPC_INIT_PARAMS.with(|p| p.replace(None).unwrap());
         let thread_create_callback = params.thread_create_callback;
         let thread_destroy_callback = params.thread_destroy_callback;
+        let position_cache_lifetime =
+            std::time::Duration::from_millis(params.position_cache_lifetime_ms as u64);
 
         let server_stream =
             unsafe { audioipc::MessageStream::from_raw_handle(params.server_connection) };
@@ -248,6 +256,7 @@ impl ContextOps for ClientContext {
             device_collection_rpc: false,
             input_device_callback: Arc::new(Mutex::new(Default::default())),
             output_device_callback: Arc::new(Mutex::new(Default::default())),
+            position_cache_lifetime,
         });
         Ok(unsafe { Context::from_ptr(Box::into_raw(ctx) as *mut _) })
     }
