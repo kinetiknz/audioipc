@@ -32,12 +32,16 @@ fn error(error: cubeb::Error) -> ClientMessage {
 
 struct CubebDeviceCollectionManager {
     servers: Mutex<Vec<Rc<RefCell<DeviceCollectionChangeCallback>>>>,
+    devidmap: DevIdMap,
+    devices: Option<cubeb::Result<Vec<DeviceInfo>>>,
 }
 
 impl CubebDeviceCollectionManager {
     fn new() -> CubebDeviceCollectionManager {
         CubebDeviceCollectionManager {
             servers: Mutex::new(Vec::new()),
+            devidmap: DevIdMap::new(),
+            devices: None,
         }
     }
 
@@ -116,6 +120,35 @@ impl CubebDeviceCollectionManager {
                     .device_collection_changed_callback(device_type)
             }
         });
+    }
+
+    // TODO: Register for devcol changes and update cache.
+    fn get_devices(&mut self, context: &cubeb::Context) -> cubeb::Result<&Vec<DeviceInfo>> {
+        if self.devices.is_none() {
+            let devices = context
+                .enumerate_devices(cubeb::DeviceType::INPUT | cubeb::DeviceType::OUTPUT)
+                .map(|devices| {
+                    devices
+                        .iter()
+                        .map(|i| {
+                            let mut tmp: DeviceInfo = i.as_ref().into();
+                            // Replace each cubeb_devid with a unique handle suitable for IPC.
+                            tmp.devid = self.devidmap.make_handle(tmp.devid);
+                            tmp
+                        })
+                        .collect()
+                });
+            self.devices = Some(devices);
+        }
+        match &self.devices {
+            Some(Ok(devices)) => Ok(devices),
+            Some(Err(e)) => Err(*e),
+            None => unreachable!(),
+        }
+    }
+
+    fn handle_to_id(&self, handle: usize) -> usize {
+        self.devidmap.handle_to_id(handle)
     }
 }
 
@@ -345,7 +378,6 @@ pub struct CubebServer {
     streams: slab::Slab<ServerStream>,
     remote_pid: Option<u32>,
     device_collection_change_callbacks: Option<Rc<RefCell<DeviceCollectionChangeCallback>>>,
-    devidmap: DevIdMap,
     shm_area_size: usize,
 }
 
@@ -359,9 +391,6 @@ impl rpccore::Server for CubebServer {
     type ClientMessage = ClientMessage;
 
     fn process(&mut self, req: Self::ServerMessage) -> Self::ClientMessage {
-        if let ServerMessage::ClientConnect(pid) = req {
-            self.remote_pid = Some(pid);
-        }
         with_local_context(|context, manager| match *context {
             Err(_) => error(cubeb::Error::error()),
             Ok(ref context) => self.process_msg(context, manager, &req),
@@ -402,7 +431,6 @@ impl CubebServer {
             streams: slab::Slab::<ServerStream>::new(),
             remote_pid: None,
             device_collection_change_callbacks: None,
-            devidmap: DevIdMap::new(),
             shm_area_size,
         }
     }
@@ -415,17 +443,15 @@ impl CubebServer {
         msg: &ServerMessage,
     ) -> ClientMessage {
         let resp: ClientMessage = match *msg {
-            ServerMessage::ClientConnect(_) => {
-                // remote_pid is set before cubeb initialization, just verify here.
-                assert!(self.remote_pid.is_some());
+            ServerMessage::ClientConnect(pid) => {
+                self.remote_pid = Some(pid);
+                if let Err(e) = manager.get_devices(context) {
+                    warn!("cubeb device cache failed: {:?}", e);
+                }
                 ClientMessage::ClientConnected
             }
 
-            ServerMessage::ClientDisconnect => {
-                // TODO:
-                //self.connection.client_disconnect();
-                ClientMessage::ClientDisconnected
-            }
+            ServerMessage::ClientDisconnect => ClientMessage::ClientDisconnected,
 
             ServerMessage::ContextGetBackendId => {
                 ClientMessage::ContextBackendId(context.backend_id().to_string())
@@ -458,19 +484,16 @@ impl CubebServer {
                 .map(ClientMessage::ContextPreferredSampleRate)
                 .unwrap_or_else(error),
 
-            ServerMessage::ContextGetDeviceEnumeration(device_type) => context
-                .enumerate_devices(cubeb::DeviceType::from_bits_truncate(device_type))
+            ServerMessage::ContextGetDeviceEnumeration(device_type) => manager
+                .get_devices(context)
                 .map(|devices| {
-                    let v: Vec<DeviceInfo> = devices
-                        .iter()
-                        .map(|i| {
-                            let mut tmp: DeviceInfo = i.as_ref().into();
-                            // Replace each cubeb_devid with a unique handle suitable for IPC.
-                            tmp.devid = self.devidmap.make_handle(tmp.devid);
-                            tmp
-                        })
-                        .collect();
-                    ClientMessage::ContextEnumeratedDevices(v)
+                    ClientMessage::ContextEnumeratedDevices(
+                        devices
+                            .iter()
+                            .filter(|i| i.device_type & device_type != 0)
+                            .cloned()
+                            .collect(),
+                    )
                 })
                 .unwrap_or_else(error),
 
@@ -479,7 +502,7 @@ impl CubebServer {
                 .unwrap_or_else(|_| error(cubeb::Error::error())),
 
             ServerMessage::StreamInit(stm_tok, ref params) => self
-                .process_stream_init(context, stm_tok, params)
+                .process_stream_init(context, manager, stm_tok, params)
                 .unwrap_or_else(|_| error(cubeb::Error::error())),
 
             ServerMessage::StreamDestroy(stm_tok) => {
@@ -721,6 +744,7 @@ impl CubebServer {
     fn process_stream_init(
         &mut self,
         context: &cubeb::Context,
+        manager: &mut CubebDeviceCollectionManager,
         stm_tok: usize,
         params: &StreamInitParams,
     ) -> Result<ClientMessage> {
@@ -731,13 +755,13 @@ impl CubebServer {
             .and_then(|name| CStr::from_bytes_with_nul(name).ok());
 
         // Map IPC handle back to cubeb_devid.
-        let input_device = self.devidmap.handle_to_id(params.input_device) as *const _;
+        let input_device = manager.handle_to_id(params.input_device) as *const _;
         let input_stream_params = params.input_stream_params.as_ref().map(|isp| unsafe {
             cubeb::StreamParamsRef::from_ptr(isp as *const StreamParams as *mut _)
         });
 
         // Map IPC handle back to cubeb_devid.
-        let output_device = self.devidmap.handle_to_id(params.output_device) as *const _;
+        let output_device = manager.handle_to_id(params.output_device) as *const _;
         let output_stream_params = params.output_stream_params.as_ref().map(|osp| unsafe {
             cubeb::StreamParamsRef::from_ptr(osp as *const StreamParams as *mut _)
         });

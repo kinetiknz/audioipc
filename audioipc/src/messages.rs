@@ -50,7 +50,7 @@ impl From<Device> for ffi::cubeb_device {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeviceInfo {
     pub devid: usize,
     #[serde(with = "serde_bytes")]
