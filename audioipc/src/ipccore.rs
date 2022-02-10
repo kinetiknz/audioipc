@@ -11,7 +11,9 @@ use mio::{event::Event, Events, Interest, Poll, Registry, Token, Waker};
 use slab::Slab;
 
 use crate::messages::AssociateHandleForMessage;
-use crate::rpccore::{make_client, make_server, Client, Handler, Proxy, Server};
+use crate::rpccore::{
+    make_callback_client, make_client, make_server, Client, DirectProxy, Handler, Proxy, Server,
+};
 use crate::{
     codec::Codec,
     codec::LengthDelimitedCodec,
@@ -71,6 +73,26 @@ impl EventLoopHandle {
         <C as Client>::ClientMessage: DeserializeOwned + Debug + AssociateHandleForMessage + Send,
     {
         let (handler, mut proxy) = make_client::<C>();
+        let driver = Box::new(FramedDriver::new(handler));
+        let r = self.add_connection(connection, driver);
+        trace!("EventLoop::bind_client {:?}", r);
+        r.map(|token| {
+            proxy.connect_event_loop(self.clone(), token);
+            proxy
+        })
+    }
+
+    // TODO: Rename this
+    // XXX: Only for use on server callback thread, for now.
+    pub fn bind_callback_client<C: Client + 'static>(
+        &self,
+        connection: sys::Pipe,
+    ) -> Result<DirectProxy<<C as Client>::ServerMessage, <C as Client>::ClientMessage>>
+    where
+        <C as Client>::ServerMessage: Serialize + Debug + AssociateHandleForMessage + Send,
+        <C as Client>::ClientMessage: DeserializeOwned + Debug + AssociateHandleForMessage + Send,
+    {
+        let (handler, mut proxy) = make_callback_client::<C>();
         let driver = Box::new(FramedDriver::new(handler));
         let r = self.add_connection(connection, driver);
         trace!("EventLoop::bind_client {:?}", r);

@@ -217,7 +217,7 @@ struct ServerStreamCallbacks {
     /// Shared memory buffer for transporting audio data to/from client
     shm: SharedMem,
     /// RPC interface to callback server running in client
-    rpc: rpccore::Proxy<CallbackReq, CallbackResp>,
+    rpc: rpccore::DirectProxy<CallbackReq, CallbackResp>,
 }
 
 impl ServerStreamCallbacks {
@@ -272,7 +272,10 @@ impl ServerStreamCallbacks {
 
     fn state_callback(&mut self, state: cubeb::State) {
         trace!("Stream state callback: {:?}", state);
-        let r = self.rpc.call(CallbackReq::State(state.into())).wait();
+        let r = self
+            .rpc
+            .call_indirect(CallbackReq::State(state.into()))
+            .wait();
         match r {
             Ok(CallbackResp::State) => {}
             _ => {
@@ -283,7 +286,7 @@ impl ServerStreamCallbacks {
 
     fn device_change_callback(&mut self) {
         trace!("Stream device change callback");
-        let r = self.rpc.call(CallbackReq::DeviceChange).wait();
+        let r = self.rpc.call_indirect(CallbackReq::DeviceChange).wait();
         match r {
             Ok(CallbackResp::DeviceChange) => {}
             _ => {
@@ -686,7 +689,7 @@ impl CubebServer {
         //       additional work is required as it's not possible to convert a Windows sys::Pipe into a raw handle.
         let rpc = self
             .callback_thread
-            .bind_client::<CallbackClient>(server_pipe)?;
+            .bind_callback_client::<CallbackClient>(server_pipe)?;
 
         // Send shm configuration to client but don't wait for result; that'll be checked in process_stream_init.
         let shm_setup = Some(rpc.call(CallbackReq::SharedMem(
