@@ -265,7 +265,7 @@ impl<C: Client> Handler for ClientHandler<C> {
     fn consume(&mut self, response: Self::In) -> Result<()> {
         trace!("ClientHandler::consume");
         if let Some(complete) = self.in_flight.pop_front() {
-            drop(complete.send(response));
+            complete.send(response);
         } else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
