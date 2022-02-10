@@ -45,7 +45,7 @@ enum Request {
     AddConnection(
         sys::Pipe,
         Box<dyn Driver + Send>,
-        mpsc::Sender<Result<Token>>,
+        mpsc::SyncSender<Result<Token>>,
     ),
     // See EventLoop::shutdown
     Shutdown,
@@ -126,7 +126,7 @@ impl EventLoopHandle {
         driver: Box<dyn Driver + Send>,
     ) -> Result<Token> {
         assert_not_in_event_loop_thread();
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(1);
         self.requests_tx
             .send(Request::AddConnection(connection, driver, tx))
             .map_err(|_| {

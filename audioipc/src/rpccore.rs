@@ -49,21 +49,21 @@ type ProxyRequest<Request, Response> = (Request, ProxySender<Response>);
 type ProxyReceiver<Request, Response> = mpsc::Receiver<ProxyRequest<Request, Response>>;
 
 enum ProxySender<Response> {
-    Channel(mpsc::Sender<Response>),
+    Channel(mpsc::SyncSender<Response>),
     DirectChannel(
-        RefCell<Option<mpsc::Sender<Response>>>,
-        Arc<Mutex<Option<mpsc::Sender<Response>>>>,
+        RefCell<Option<mpsc::SyncSender<Response>>>,
+        Arc<Mutex<Option<mpsc::SyncSender<Response>>>>,
     ),
 }
 
 impl<Response> ProxySender<Response> {
-    fn new(tx: mpsc::Sender<Response>) -> Self {
+    fn new(tx: mpsc::SyncSender<Response>) -> Self {
         Self::Channel(tx)
     }
 
     fn new_direct(
-        tx: mpsc::Sender<Response>,
-        used_slot: Arc<Mutex<Option<mpsc::Sender<Response>>>>,
+        tx: mpsc::SyncSender<Response>,
+        used_slot: Arc<Mutex<Option<mpsc::SyncSender<Response>>>>,
     ) -> Self {
         Self::DirectChannel(RefCell::new(Some(tx)), used_slot)
     }
@@ -126,12 +126,12 @@ impl<Response> ProxyResponse<Response> {
 #[derive(Debug)]
 pub struct Proxy<Request, Response> {
     handle: Option<(EventLoopHandle, Token)>,
-    tx: ManuallyDrop<mpsc::Sender<ProxyRequest<Request, Response>>>,
+    tx: ManuallyDrop<mpsc::SyncSender<ProxyRequest<Request, Response>>>,
 }
 
 impl<Request, Response> Proxy<Request, Response> {
     pub fn call(&self, request: Request) -> ProxyResponse<Response> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(1);
         match self.tx.send((request, ProxySender::new(tx))) {
             Ok(_) => self.wake_connection(),
             Err(e) => debug!("Proxy::call error={:?}", e),
@@ -178,8 +178,8 @@ impl<Request, Response> Drop for Proxy<Request, Response> {
 #[derive(Debug)]
 pub struct DirectProxy<Request, Response> {
     handle: Option<(EventLoopHandle, Token)>,
-    tx: ManuallyDrop<mpsc::Sender<ProxyRequest<Request, Response>>>,
-    chan_tx: Arc<Mutex<Option<mpsc::Sender<Response>>>>,
+    tx: ManuallyDrop<mpsc::SyncSender<ProxyRequest<Request, Response>>>,
+    chan_tx: Arc<Mutex<Option<mpsc::SyncSender<Response>>>>,
     chan_rx: Arc<Mutex<Option<mpsc::Receiver<Response>>>>,
 }
 
@@ -203,7 +203,7 @@ impl<Request, Response> DirectProxy<Request, Response> {
     }
 
     pub fn call_indirect(&self, request: Request) -> ProxyResponse<Response> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(1);
         match self.tx.send((request, ProxySender::new(tx))) {
             Ok(_) => self.wake_connection(),
             Err(e) => debug!("Proxy::call error={:?}", e),
@@ -300,7 +300,7 @@ impl<C: Client> Handler for ClientHandler<C> {
 
 pub(crate) fn make_client<C: Client>(
 ) -> (ClientHandler<C>, Proxy<C::ServerMessage, C::ClientMessage>) {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(32);
 
     let handler = ClientHandler::<C> {
         messages: rx,
@@ -325,14 +325,14 @@ pub(crate) fn make_callback_client<C: Client>() -> (
     ClientHandler<C>,
     DirectProxy<C::ServerMessage, C::ClientMessage>,
 ) {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(32);
 
     let handler = ClientHandler::<C> {
         messages: rx,
-        in_flight: VecDeque::with_capacity(1),
+        in_flight: VecDeque::with_capacity(32),
     };
 
-    let (chan_tx, chan_rx) = mpsc::channel();
+    let (chan_tx, chan_rx) = mpsc::sync_channel(1);
 
     // Sender is Send, but !Sync, so it's not safe to move between threads
     // without cloning it first.  Force a clone here, since we use Proxy in
