@@ -3,13 +3,12 @@
 // This program is made available under an ISC-style license.  See the
 // accompanying file LICENSE for details
 
+use std::cell::RefCell;
 use std::io::{self, Result};
 use std::mem::ManuallyDrop;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::{collections::VecDeque, sync::mpsc};
 
-use crossbeam_utils::atomic::AtomicCell;
-use crossbeam_utils::sync::{Parker, Unparker};
 use mio::Token;
 
 use crate::ipccore::EventLoopHandle;
@@ -46,55 +45,15 @@ pub trait Server {
 
 // RPC Client Proxy implementation.  ProxyRequest's Sender is connected to ProxyReceiver's Receiver,
 // allowing the ProxyReceiver to wait on a response from the proxy.
-type ProxyRequest<Request, Response> = (Request, ProxySender<Response>);
+type ProxyRequest<Request, Response> = (Request, mpsc::SyncSender<Response>);
 type ProxyReceiver<Request, Response> = mpsc::Receiver<ProxyRequest<Request, Response>>;
-
-enum ProxySender<Response> {
-    Channel(mpsc::SyncSender<Response>),
-    Parker(Unparker, Arc<AtomicCell<Option<Response>>>),
-}
-
-impl<Response> ProxySender<Response> {
-    fn new_channel(tx: mpsc::SyncSender<Response>) -> Self {
-        Self::Channel(tx)
-    }
-
-    fn new_parker(
-        waiter: Unparker,
-        response: Arc<AtomicCell<Option<Response>>>,
-    ) -> Self {
-        Self::Parker(waiter, response)
-    }
-
-    fn send(self, resp: Response) {
-        match &self {
-            Self::Channel(tx) => {
-                if let Err(e) = tx.send(resp) {
-                    debug!("ProxySender::send failed: {:?}", e);
-                }
-            }
-            Self::Parker(waiter, response) => {
-                response.store(Some(resp));
-                waiter.unpark();
-            }
-        }
-    }
-}
-
-impl<Response> Drop for ProxySender<Response> {
-    fn drop(&mut self) {
-        if let Self::Parker(waiter, _) = self {
-            waiter.unpark();
-        }
-    }
-}
 
 // Each RPC Proxy `call` returns a blocking waitable ProxyResponse.
 // `wait` produces the response received over RPC from the associated
 // Proxy `call`.
 pub enum ProxyResponse<Response> {
     Channel(mpsc::Receiver<Response>),
-    Direct(Parker, Arc<AtomicCell<Option<Response>>>),
+    Direct(Rc<RefCell<Option<Response>>>),
 }
 
 impl<Response> ProxyResponse<Response> {
@@ -107,12 +66,8 @@ impl<Response> ProxyResponse<Response> {
                     "proxy recv error",
                 )),
             },
-            Self::Direct(parker, slot) => loop {
-                if let Some(response) = slot.take() {
-                    return Ok(response);
-                }
-                parker.park();
-            },
+            // XXX need to call poll here, or caller must have polled this EL before waiting
+            Self::Direct(response) => Ok(response.take().unwrap()),
         }
     }
 }
@@ -130,7 +85,7 @@ pub struct Proxy<Request, Response> {
 impl<Request, Response> Proxy<Request, Response> {
     pub fn call(&self, request: Request) -> ProxyResponse<Response> {
         let (tx, rx) = mpsc::sync_channel(1);
-        match self.tx.send((request, ProxySender::new_channel(tx))) {
+        match self.tx.send((request, tx)) {
             Ok(_) => self.wake_connection(),
             Err(e) => debug!("Proxy::call error={:?}", e),
         }
@@ -171,46 +126,18 @@ impl<Request, Response> Drop for Proxy<Request, Response> {
 
 // XXX: Docs
 pub struct DirectProxy<Request, Response> {
-    handle: Option<(EventLoopHandle, Token)>,
-    tx: ManuallyDrop<mpsc::SyncSender<ProxyRequest<Request, Response>>>,
-    response: Arc<AtomicCell<Option<Response>>>,
+    message: (Rc<RefCell<Option<Request>>>, Rc<RefCell<Option<Response>>>),
 }
 
 impl<Request, Response> DirectProxy<Request, Response> {
     pub fn call(&mut self, request: Request) -> ProxyResponse<Response> {
-         // Note: assert ProxyResponse::wait caller is same thread as DirectProxy::call caller.
-        let waiter = Parker::new();
-        match self.tx.send((
-            request,
-            ProxySender::new_parker(waiter.unparker().clone(), self.response.clone()),
-        )) {
-            Ok(_) => self.wake_connection(),
-            Err(e) => debug!("Proxy::call error={:?}", e),
-        }
-
-        ProxyResponse::Direct(waiter, self.response.clone())
+        *self.message.0.borrow_mut() = Some(request);
+        ProxyResponse::Direct(self.message.1.clone())
     }
 
-    pub(crate) fn connect_event_loop(&mut self, handle: EventLoopHandle, token: Token) {
-        self.handle = Some((handle, token));
-    }
-
-    fn wake_connection(&self) {
-        let (handle, token) = self
-            .handle
-            .as_ref()
-            .expect("proxy not connected to event loop");
-        handle.wake_connection(*token);
-    }
-}
-
-impl<Request, Response> Drop for DirectProxy<Request, Response> {
-    fn drop(&mut self) {
-        trace!("DirectProxy drop, waking EventLoop");
-        // Must drop Sender before waking the connection, otherwise
-        // the wake may be processed before Sender is closed.
-        unsafe { ManuallyDrop::drop(&mut self.tx) }
-        self.wake_connection();
+    pub fn call_indirect(&mut self, request: Request) -> ProxyResponse<Response> {
+        *self.message.0.borrow_mut() = Some(request);
+        ProxyResponse::Direct(self.message.1.clone())
     }
 }
 
@@ -223,7 +150,7 @@ impl<Request, Response> Drop for DirectProxy<Request, Response> {
 // connected to a ProxyResponse.
 pub(crate) struct ClientHandler<C: Client> {
     messages: ProxyReceiver<C::ServerMessage, C::ClientMessage>,
-    in_flight: VecDeque<ProxySender<C::ClientMessage>>,
+    in_flight: VecDeque<mpsc::SyncSender<C::ClientMessage>>,
 }
 
 impl<C: Client> Handler for ClientHandler<C> {
@@ -233,7 +160,9 @@ impl<C: Client> Handler for ClientHandler<C> {
     fn consume(&mut self, response: Self::In) -> Result<()> {
         trace!("ClientHandler::consume");
         if let Some(complete) = self.in_flight.pop_front() {
-            complete.send(response);
+            if let Err(e) = complete.send(response) {
+                debug!("ClientHandler::consume send failed: {:?}", e);
+            }
         } else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -289,27 +218,39 @@ pub(crate) fn make_client<C: Client>(
     (handler, proxy)
 }
 
+pub(crate) struct DirectClientHandler<C: Client> {
+    message: (Rc<RefCell<Option<C::ServerMessage>>>, Rc<RefCell<Option<C::ClientMessage>>>),
+}
+
+impl<C: Client> Handler for DirectClientHandler<C> {
+    type In = C::ClientMessage;
+    type Out = C::ServerMessage;
+
+    fn consume(&mut self, response: Self::In) -> Result<()> {
+        trace!("DirectClientHandler::consume");
+        *self.message.1.borrow_mut() = Some(response);
+        Ok(())
+    }
+
+    fn produce(&mut self) -> Result<Option<Self::Out>> {
+        trace!("DirectClientHandler::produce");
+        Ok(self.message.0.borrow_mut().take())
+    }
+}
+
+unsafe impl<C: Client> Send for DirectClientHandler<C> {}
+
 pub(crate) fn make_callback_client<C: Client>() -> (
-    ClientHandler<C>,
+    DirectClientHandler<C>,
     DirectProxy<C::ServerMessage, C::ClientMessage>,
 ) {
-    let (tx, rx) = mpsc::sync_channel(32);
-
-    let handler = ClientHandler::<C> {
-        messages: rx,
-        in_flight: VecDeque::with_capacity(1),
+    let handler = DirectClientHandler::<C> {
+        message: Default::default()
     };
 
-    // Sender is Send, but !Sync, so it's not safe to move between threads
-    // without cloning it first.  Force a clone here, since we use Proxy in
-    // native code and it's possible to move it between threads without Rust's
-    // type system noticing.
     #[allow(clippy::redundant_clone)]
-    let tx = tx.clone();
     let proxy = DirectProxy {
-        handle: None,
-        tx: ManuallyDrop::new(tx),
-        response: Default::default(),
+        message: handler.message.clone(),
     };
     (handler, proxy)
 }

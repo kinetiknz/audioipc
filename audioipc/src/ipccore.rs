@@ -92,14 +92,11 @@ impl EventLoopHandle {
         <C as Client>::ServerMessage: Serialize + Debug + AssociateHandleForMessage + Send,
         <C as Client>::ClientMessage: DeserializeOwned + Debug + AssociateHandleForMessage + Send,
     {
-        let (handler, mut proxy) = make_callback_client::<C>();
+        let (handler, proxy) = make_callback_client::<C>();
         let driver = Box::new(FramedDriver::new(handler));
         let r = self.add_connection(connection, driver);
-        trace!("EventLoop::bind_client {:?}", r);
-        r.map(|token| {
-            proxy.connect_event_loop(self.clone(), token);
-            proxy
-        })
+        trace!("EventLoop::bind_callback_client {:?}", r);
+        r.map(|_| proxy)
     }
 
     pub fn bind_server<S: Server + Send + 'static>(
