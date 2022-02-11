@@ -222,7 +222,11 @@ pub fn client_test(handle: audioipc::PlatformHandleType) -> Result<()> {
 
     query!(stream.set_volume(1.0));
     query!(stream.start());
-    thread::sleep(Duration::from_millis(500));
+    println!("stream pos={}", query!(stream.position()));
+    for _ in 0..180 {
+        thread::sleep(Duration::from_millis(1000));
+        println!("stream pos={}", query!(stream.position()));
+    }
     query!(stream.stop());
 
     Ok(())
