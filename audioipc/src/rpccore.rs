@@ -67,6 +67,7 @@ impl<Response> ProxyResponse<Response> {
                 )),
             },
             // XXX need to call poll here, or caller must have polled this EL before waiting
+            // Indirect needs a cond or park/unpark to wait on resp
             Self::Direct(response) => Ok(response.take().unwrap()),
         }
     }
@@ -132,11 +133,7 @@ pub struct DirectProxy<Request, Response> {
 impl<Request, Response> DirectProxy<Request, Response> {
     pub fn call(&mut self, request: Request) -> ProxyResponse<Response> {
         *self.message.0.borrow_mut() = Some(request);
-        ProxyResponse::Direct(self.message.1.clone())
-    }
-
-    pub fn call_indirect(&mut self, request: Request) -> ProxyResponse<Response> {
-        *self.message.0.borrow_mut() = Some(request);
+        // XXX handle.do_send
         ProxyResponse::Direct(self.message.1.clone())
     }
 }
