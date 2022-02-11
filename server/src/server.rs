@@ -684,7 +684,7 @@ impl CubebServer {
         let (server_pipe, client_pipe) = sys::make_pipe_pair()?;
         // TODO: this should bind the client_pipe and send the server_pipe to the remote, but
         //       additional work is required as it's not possible to convert a Windows sys::Pipe into a raw handle.
-        let rpc = self
+        let mut rpc = self
             .callback_thread
             .bind_callback_client::<CallbackClient>(server_pipe)?;
 

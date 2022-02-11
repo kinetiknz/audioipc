@@ -5,7 +5,6 @@
 
 use std::io::{self, Result};
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::{collections::VecDeque, sync::mpsc};
 
@@ -52,7 +51,7 @@ type ProxyReceiver<Request, Response> = mpsc::Receiver<ProxyRequest<Request, Res
 
 enum ProxySender<Response> {
     Channel(mpsc::SyncSender<Response>),
-    Parker(Unparker, Arc<(AtomicBool, AtomicCell<Option<Response>>)>),
+    Parker(Unparker, Arc<AtomicCell<Option<Response>>>),
 }
 
 impl<Response> ProxySender<Response> {
@@ -62,7 +61,7 @@ impl<Response> ProxySender<Response> {
 
     fn new_parker(
         waiter: Unparker,
-        response: Arc<(AtomicBool, AtomicCell<Option<Response>>)>,
+        response: Arc<AtomicCell<Option<Response>>>,
     ) -> Self {
         Self::Parker(waiter, response)
     }
@@ -75,8 +74,7 @@ impl<Response> ProxySender<Response> {
                 }
             }
             Self::Parker(waiter, response) => {
-                assert!(response.0.load(Ordering::Relaxed));
-                response.1.store(Some(resp));
+                response.store(Some(resp));
                 waiter.unpark();
             }
         }
@@ -96,7 +94,7 @@ impl<Response> Drop for ProxySender<Response> {
 // Proxy `call`.
 pub enum ProxyResponse<Response> {
     Channel(mpsc::Receiver<Response>),
-    Direct(Parker, Arc<(AtomicBool, AtomicCell<Option<Response>>)>),
+    Direct(Parker, Arc<AtomicCell<Option<Response>>>),
 }
 
 impl<Response> ProxyResponse<Response> {
@@ -109,9 +107,8 @@ impl<Response> ProxyResponse<Response> {
                     "proxy recv error",
                 )),
             },
-            Self::Direct(parker, resp) => loop {
-                if let Some(response) = resp.1.take() {
-                    resp.0.store(false, Ordering::Relaxed);
+            Self::Direct(parker, slot) => loop {
+                if let Some(response) = slot.take() {
                     return Ok(response);
                 }
                 parker.park();
@@ -176,29 +173,22 @@ impl<Request, Response> Drop for Proxy<Request, Response> {
 pub struct DirectProxy<Request, Response> {
     handle: Option<(EventLoopHandle, Token)>,
     tx: ManuallyDrop<mpsc::SyncSender<ProxyRequest<Request, Response>>>,
-    responses: Vec<Arc<(AtomicBool, AtomicCell<Option<Response>>)>>,
+    response: Arc<AtomicCell<Option<Response>>>,
 }
 
 impl<Request, Response> DirectProxy<Request, Response> {
-    pub fn call(&self, request: Request) -> ProxyResponse<Response> {
-        let slot = {
-            let idx = self.responses.iter().position(|s| {
-                s.0.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-            });
-            &self.responses[idx.unwrap()]
-        };
-
-        let waiter = Parker::new(); // Note: assert waiter is same thread.
+    pub fn call(&mut self, request: Request) -> ProxyResponse<Response> {
+         // Note: assert ProxyResponse::wait caller is same thread as DirectProxy::call caller.
+        let waiter = Parker::new();
         match self.tx.send((
             request,
-            ProxySender::new_parker(waiter.unparker().clone(), slot.clone()),
+            ProxySender::new_parker(waiter.unparker().clone(), self.response.clone()),
         )) {
             Ok(_) => self.wake_connection(),
             Err(e) => debug!("Proxy::call error={:?}", e),
         }
 
-        ProxyResponse::Direct(waiter, slot.clone())
+        ProxyResponse::Direct(waiter, self.response.clone())
     }
 
     pub(crate) fn connect_event_loop(&mut self, handle: EventLoopHandle, token: Token) {
@@ -307,7 +297,7 @@ pub(crate) fn make_callback_client<C: Client>() -> (
 
     let handler = ClientHandler::<C> {
         messages: rx,
-        in_flight: VecDeque::with_capacity(32),
+        in_flight: VecDeque::with_capacity(1),
     };
 
     // Sender is Send, but !Sync, so it's not safe to move between threads
@@ -316,11 +306,10 @@ pub(crate) fn make_callback_client<C: Client>() -> (
     // type system noticing.
     #[allow(clippy::redundant_clone)]
     let tx = tx.clone();
-    let responses = vec![Default::default(); 4];
     let proxy = DirectProxy {
         handle: None,
         tx: ManuallyDrop::new(tx),
-        responses,
+        response: Default::default(),
     };
     (handler, proxy)
 }
