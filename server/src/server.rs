@@ -272,10 +272,7 @@ impl ServerStreamCallbacks {
 
     fn state_callback(&mut self, state: cubeb::State) {
         trace!("Stream state callback: {:?}", state);
-        let r = self
-            .rpc
-            .call_indirect(CallbackReq::State(state.into()))
-            .wait();
+        let r = self.rpc.call(CallbackReq::State(state.into())).wait();
         match r {
             Ok(CallbackResp::State) => {}
             _ => {
@@ -286,7 +283,7 @@ impl ServerStreamCallbacks {
 
     fn device_change_callback(&mut self) {
         trace!("Stream device change callback");
-        let r = self.rpc.call_indirect(CallbackReq::DeviceChange).wait();
+        let r = self.rpc.call(CallbackReq::DeviceChange).wait();
         match r {
             Ok(CallbackResp::DeviceChange) => {}
             _ => {

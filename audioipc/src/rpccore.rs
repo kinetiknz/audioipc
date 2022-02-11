@@ -3,12 +3,14 @@
 // This program is made available under an ISC-style license.  See the
 // accompanying file LICENSE for details
 
-use std::cell::RefCell;
 use std::io::{self, Result};
 use std::mem::ManuallyDrop;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::{collections::VecDeque, sync::mpsc};
 
+use crossbeam_utils::atomic::AtomicCell;
+use crossbeam_utils::sync::{Parker, Unparker};
 use mio::Token;
 
 use crate::ipccore::EventLoopHandle;
@@ -50,22 +52,19 @@ type ProxyReceiver<Request, Response> = mpsc::Receiver<ProxyRequest<Request, Res
 
 enum ProxySender<Response> {
     Channel(mpsc::SyncSender<Response>),
-    DirectChannel(
-        RefCell<Option<mpsc::SyncSender<Response>>>,
-        Arc<Mutex<Option<mpsc::SyncSender<Response>>>>,
-    ),
+    Parker(Unparker, Arc<(AtomicBool, AtomicCell<Option<Response>>)>),
 }
 
 impl<Response> ProxySender<Response> {
-    fn new(tx: mpsc::SyncSender<Response>) -> Self {
+    fn new_channel(tx: mpsc::SyncSender<Response>) -> Self {
         Self::Channel(tx)
     }
 
-    fn new_direct(
-        tx: mpsc::SyncSender<Response>,
-        used_slot: Arc<Mutex<Option<mpsc::SyncSender<Response>>>>,
+    fn new_parker(
+        waiter: Unparker,
+        response: Arc<(AtomicBool, AtomicCell<Option<Response>>)>,
     ) -> Self {
-        Self::DirectChannel(RefCell::new(Some(tx)), used_slot)
+        Self::Parker(waiter, response)
     }
 
     fn send(&self, resp: Response) {
@@ -75,11 +74,10 @@ impl<Response> ProxySender<Response> {
                     debug!("ProxySender::send failed: {:?}", e);
                 }
             }
-            Self::DirectChannel(tx, p) => {
-                if let Err(e) = tx.borrow().as_ref().unwrap().send(resp) {
-                    debug!("ProxySender::send failed: {:?}", e);
-                }
-                *p.lock().unwrap() = tx.borrow_mut().take();
+            Self::Parker(waiter, response) => {
+                assert!(response.0.load(Ordering::Relaxed));
+                response.1.store(Some(resp));
+                waiter.unpark();
             }
         }
     }
@@ -88,32 +86,27 @@ impl<Response> ProxySender<Response> {
 // Each RPC Proxy `call` returns a blocking waitable ProxyResponse.
 // `wait` produces the response received over RPC from the associated
 // Proxy `call`.
-pub struct ProxyResponse<Response> {
-    inner: RefCell<Option<mpsc::Receiver<Response>>>,
-    used_slot: Option<Arc<Mutex<Option<mpsc::Receiver<Response>>>>>,
+pub enum ProxyResponse<Response> {
+    Channel(mpsc::Receiver<Response>),
+    Direct(Parker, Arc<(AtomicBool, AtomicCell<Option<Response>>)>),
 }
 
 impl<Response> ProxyResponse<Response> {
     pub fn wait(&self) -> Result<Response> {
-        match self.used_slot.as_ref() {
-            Some(p) => {
-                let inner = self.inner.take();
-                let r = match inner.as_ref().unwrap().recv() {
-                    Ok(resp) => Ok(resp),
-                    Err(_) => Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "proxy recv error",
-                    )),
-                };
-                *p.lock().unwrap() = inner;
-                r
-            }
-            None => match self.inner.borrow().as_ref().unwrap().recv() {
+        match self {
+            Self::Channel(rx) => match rx.recv() {
                 Ok(resp) => Ok(resp),
                 Err(_) => Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     "proxy recv error",
                 )),
+            },
+            Self::Direct(parker, resp) => loop {
+                if let Some(response) = resp.1.take() {
+                    resp.0.store(false, Ordering::Relaxed);
+                    return Ok(response);
+                }
+                parker.park();
             },
         }
     }
@@ -132,14 +125,11 @@ pub struct Proxy<Request, Response> {
 impl<Request, Response> Proxy<Request, Response> {
     pub fn call(&self, request: Request) -> ProxyResponse<Response> {
         let (tx, rx) = mpsc::sync_channel(1);
-        match self.tx.send((request, ProxySender::new(tx))) {
+        match self.tx.send((request, ProxySender::new_channel(tx))) {
             Ok(_) => self.wake_connection(),
             Err(e) => debug!("Proxy::call error={:?}", e),
         }
-        ProxyResponse {
-            inner: RefCell::new(Some(rx)),
-            used_slot: None,
-        }
+        ProxyResponse::Channel(rx)
     }
 
     pub(crate) fn connect_event_loop(&mut self, handle: EventLoopHandle, token: Token) {
@@ -175,43 +165,32 @@ impl<Request, Response> Drop for Proxy<Request, Response> {
 }
 
 // XXX: Docs
-#[derive(Debug)]
 pub struct DirectProxy<Request, Response> {
     handle: Option<(EventLoopHandle, Token)>,
     tx: ManuallyDrop<mpsc::SyncSender<ProxyRequest<Request, Response>>>,
-    chan_tx: Arc<Mutex<Option<mpsc::SyncSender<Response>>>>,
-    chan_rx: Arc<Mutex<Option<mpsc::Receiver<Response>>>>,
+    responses: Vec<Arc<(AtomicBool, AtomicCell<Option<Response>>)>>,
 }
 
 impl<Request, Response> DirectProxy<Request, Response> {
     pub fn call(&self, request: Request) -> ProxyResponse<Response> {
-        let used_slot = self.chan_tx.clone();
-        let tx = self.chan_tx.lock().unwrap().take().unwrap();
-        match self
-            .tx
-            .send((request, ProxySender::new_direct(tx, used_slot)))
-        {
-            Ok(_) => self.wake_connection(),
-            Err(e) => debug!("Proxy::call error={:?}", e),
-        }
-        let used_slot = Some(self.chan_rx.clone());
-        let rx = self.chan_rx.lock().unwrap().take().unwrap();
-        ProxyResponse {
-            inner: RefCell::new(Some(rx)),
-            used_slot,
-        }
-    }
+        let slot = {
+            let idx = self.responses.iter().position(|s| {
+                s.0.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            });
+            &self.responses[idx.unwrap()]
+        };
 
-    pub fn call_indirect(&self, request: Request) -> ProxyResponse<Response> {
-        let (tx, rx) = mpsc::sync_channel(1);
-        match self.tx.send((request, ProxySender::new(tx))) {
+        let waiter = Parker::new(); // Note: assert waiter is same thread.
+        match self.tx.send((
+            request,
+            ProxySender::new_parker(waiter.unparker().clone(), slot.clone()),
+        )) {
             Ok(_) => self.wake_connection(),
             Err(e) => debug!("Proxy::call error={:?}", e),
         }
-        ProxyResponse {
-            inner: RefCell::new(Some(rx)),
-            used_slot: None,
-        }
+
+        ProxyResponse::Direct(waiter, slot.clone())
     }
 
     pub(crate) fn connect_event_loop(&mut self, handle: EventLoopHandle, token: Token) {
@@ -226,15 +205,6 @@ impl<Request, Response> DirectProxy<Request, Response> {
         handle.wake_connection(*token);
     }
 }
-
-// impl<Request, Response> Clone for DirectProxy<Request, Response> {
-//     fn clone(&self) -> Self {
-//         Proxy {
-//             handle: self.handle.clone(),
-//             tx: self.tx.clone(),
-//         }
-//     }
-// }
 
 impl<Request, Response> Drop for DirectProxy<Request, Response> {
     fn drop(&mut self) {
@@ -332,21 +302,18 @@ pub(crate) fn make_callback_client<C: Client>() -> (
         in_flight: VecDeque::with_capacity(32),
     };
 
-    let (chan_tx, chan_rx) = mpsc::sync_channel(1);
-
     // Sender is Send, but !Sync, so it's not safe to move between threads
     // without cloning it first.  Force a clone here, since we use Proxy in
     // native code and it's possible to move it between threads without Rust's
     // type system noticing.
     #[allow(clippy::redundant_clone)]
     let tx = tx.clone();
+    let responses = vec![Default::default(); 4];
     let proxy = DirectProxy {
         handle: None,
         tx: ManuallyDrop::new(tx),
-        chan_tx: Arc::new(Mutex::new(Some(chan_tx))),
-        chan_rx: Arc::new(Mutex::new(Some(chan_rx))),
+        responses,
     };
-
     (handler, proxy)
 }
 
