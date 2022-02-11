@@ -67,8 +67,8 @@ impl<Response> ProxySender<Response> {
         Self::Parker(waiter, response)
     }
 
-    fn send(&self, resp: Response) {
-        match self {
+    fn send(self, resp: Response) {
+        match &self {
             Self::Channel(tx) => {
                 if let Err(e) = tx.send(resp) {
                     debug!("ProxySender::send failed: {:?}", e);
@@ -79,6 +79,14 @@ impl<Response> ProxySender<Response> {
                 response.1.store(Some(resp));
                 waiter.unpark();
             }
+        }
+    }
+}
+
+impl<Response> Drop for ProxySender<Response> {
+    fn drop(&mut self) {
+        if let Self::Parker(waiter, _) = self {
+            waiter.unpark();
         }
     }
 }
