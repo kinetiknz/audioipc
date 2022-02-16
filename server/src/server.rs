@@ -240,8 +240,12 @@ struct ServerStreamCallbacks {
     output_frame_size: u16,
     /// Shared memory buffer for transporting audio data to/from client
     shm: SharedMem,
-    /// RPC interface to callback server running in client
-    rpc: rpccore::Proxy<CallbackReq, CallbackResp>,
+    /// RPC interface for data_callback (on OS audio thread) to server callback thread
+    data_callback_rpc: rpccore::Proxy<CallbackReq, CallbackResp>,
+    /// RPC interface for state_callback (on any thread) to server callback thread
+    state_callback_rpc: rpccore::Proxy<CallbackReq, CallbackResp>,
+    /// RPC interface for device_change_callback (on any thread) to server callback thread
+    device_change_callback_rpc: rpccore::Proxy<CallbackReq, CallbackResp>,
 }
 
 impl ServerStreamCallbacks {
@@ -263,7 +267,7 @@ impl ServerStreamCallbacks {
         }
 
         let r = self
-            .rpc
+            .data_callback_rpc
             .call(CallbackReq::Data {
                 nframes,
                 input_frame_size: self.input_frame_size as usize,
@@ -296,7 +300,10 @@ impl ServerStreamCallbacks {
 
     fn state_callback(&mut self, state: cubeb::State) {
         trace!("Stream state callback: {:?}", state);
-        let r = self.rpc.call(CallbackReq::State(state.into())).wait();
+        let r = self
+            .state_callback_rpc
+            .call(CallbackReq::State(state.into()))
+            .wait();
         match r {
             Ok(CallbackResp::State) => {}
             _ => {
@@ -307,7 +314,10 @@ impl ServerStreamCallbacks {
 
     fn device_change_callback(&mut self) {
         trace!("Stream device change callback");
-        let r = self.rpc.call(CallbackReq::DeviceChange).wait();
+        let r = self
+            .device_change_callback_rpc
+            .call(CallbackReq::DeviceChange)
+            .wait();
         match r {
             Ok(CallbackResp::DeviceChange) => {}
             _ => {
@@ -738,7 +748,9 @@ impl CubebServer {
             input_frame_size,
             output_frame_size,
             shm,
-            rpc,
+            state_callback_rpc: rpc.clone(),
+            device_change_callback_rpc: rpc.clone(),
+            data_callback_rpc: rpc,
         });
 
         let entry = self.streams.vacant_entry();
