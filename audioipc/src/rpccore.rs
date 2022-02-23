@@ -3,11 +3,14 @@
 // This program is made available under an ISC-style license.  See the
 // accompanying file LICENSE for details
 
+use std::collections::VecDeque;
 use std::io::{self, Result};
 use std::mem::ManuallyDrop;
-use std::{collections::VecDeque, sync::mpsc};
+use std::sync::{Arc, Weak};
 
+use crossbeam::queue::ArrayQueue;
 use mio::Token;
+use parking_lot::{Condvar, Mutex};
 
 use crate::ipccore::EventLoopHandle;
 
@@ -41,27 +44,24 @@ pub trait Server {
     fn process(&mut self, req: Self::ServerMessage) -> Self::ClientMessage;
 }
 
-// RPC Client Proxy implementation.  ProxyRequest's Sender is connected to ProxyReceiver's Receiver,
-// allowing the ProxyReceiver to wait on a response from the proxy.
-type ProxyRequest<Request, Response> = (Request, mpsc::Sender<Response>);
-type ProxyReceiver<Request, Response> = mpsc::Receiver<ProxyRequest<Request, Response>>;
-
 // Each RPC Proxy `call` returns a blocking waitable ProxyResponse.
 // `wait` produces the response received over RPC from the associated
 // Proxy `call`.
 pub struct ProxyResponse<Response> {
-    inner: mpsc::Receiver<Response>,
+    response: Option<ResponseSlot<Response>>,
 }
 
 impl<Response> ProxyResponse<Response> {
-    pub fn wait(&self) -> Result<Response> {
-        match self.inner.recv() {
-            Ok(resp) => Ok(resp),
-            Err(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "proxy recv error",
-            )),
+    pub fn wait(self) -> Result<Response> {
+        if let Some(slot) = self.response {
+            if let Some(response) = slot.get() {
+                return Ok(response);
+            }
         }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "proxy recv error",
+        ))
     }
 }
 
@@ -71,18 +71,21 @@ impl<Response> ProxyResponse<Response> {
 // `wait`ing on the returned ProxyResponse.
 #[derive(Debug)]
 pub struct Proxy<Request, Response> {
+    inner: ManuallyDrop<Arc<Inner<Request, Response>>>,
     handle: Option<(EventLoopHandle, Token)>,
-    tx: ManuallyDrop<mpsc::Sender<ProxyRequest<Request, Response>>>,
 }
 
 impl<Request, Response> Proxy<Request, Response> {
     pub fn call(&self, request: Request) -> ProxyResponse<Response> {
-        let (tx, rx) = mpsc::channel();
-        match self.tx.send((request, tx)) {
-            Ok(_) => self.wake_connection(),
-            Err(e) => debug!("Proxy::call error={:?}", e),
+        // If inner's weak_count is zero, the ClientHandler has dropped its reference.
+        if Arc::weak_count(&self.inner) == 0 {
+            return ProxyResponse { response: None };
         }
-        ProxyResponse { inner: rx }
+        let slot = self.inner.send(request);
+        self.wake_connection();
+        ProxyResponse {
+            response: Some(slot),
+        }
     }
 
     pub(crate) fn connect_event_loop(&mut self, handle: EventLoopHandle, token: Token) {
@@ -100,9 +103,10 @@ impl<Request, Response> Proxy<Request, Response> {
 
 impl<Request, Response> Clone for Proxy<Request, Response> {
     fn clone(&self) -> Self {
+        assert!(self.handle.is_some());
         Proxy {
             handle: self.handle.clone(),
-            tx: self.tx.clone(),
+            inner: self.inner.clone(),
         }
     }
 }
@@ -110,12 +114,67 @@ impl<Request, Response> Clone for Proxy<Request, Response> {
 impl<Request, Response> Drop for Proxy<Request, Response> {
     fn drop(&mut self) {
         trace!("Proxy drop, waking EventLoop");
-        // Must drop Sender before waking the connection, otherwise
-        // the wake may be processed before Sender is closed.
-        unsafe { ManuallyDrop::drop(&mut self.tx) }
-        if self.handle.is_some() {
-            self.wake_connection()
+        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
+        if self.handle.is_some() && Arc::try_unwrap(inner).is_ok() {
+            // Last Proxy alive, wake connection to clean up ClientHandler.
+            self.wake_connection();
         }
+    }
+}
+
+struct ResponseSlot<Response> {
+    slot: Arc<(Mutex<Option<Response>>, Condvar)>,
+}
+
+impl<Response> ResponseSlot<Response> {
+    fn new() -> Self {
+        ResponseSlot {
+            slot: Arc::new((Mutex::new(None), Condvar::new())),
+        }
+    }
+
+    fn set(&self, response: Response) {
+        *self.slot.0.lock() = Some(response);
+        self.slot.1.notify_one();
+    }
+
+    fn get(&self) -> Option<Response> {
+        // TODO: calling `get` twice deadlocks instead of errors.
+        let mut slot = self.slot.0.lock();
+        if slot.is_none() {
+            self.slot.1.wait(&mut slot);
+        }
+        slot.take()
+    }
+}
+
+impl<Response> Clone for ResponseSlot<Response> {
+    fn clone(&self) -> Self {
+        Self {
+            slot: self.slot.clone(),
+        }
+    }
+}
+
+impl<Response> Drop for ResponseSlot<Response> {
+    fn drop(&mut self) {
+        self.slot.1.notify_one();
+    }
+}
+
+#[derive(Debug)]
+struct Inner<Request, Response> {
+    outbound: ArrayQueue<(Request, ResponseSlot<Response>)>,
+    inbound_responses: ArrayQueue<ResponseSlot<Response>>,
+}
+
+impl<Request, Response> Inner<Request, Response> {
+    fn send(&self, request: Request) -> ResponseSlot<Response> {
+        let slot = self.inbound_responses.pop().unwrap();
+        if self.outbound.push((request, slot.clone())).is_err() {
+            panic!()
+        }
+        slot
     }
 }
 
@@ -127,8 +186,8 @@ impl<Request, Response> Drop for Proxy<Request, Response> {
 // trigger response completion by sending the response via a channel
 // connected to a ProxyResponse.
 pub(crate) struct ClientHandler<C: Client> {
-    messages: ProxyReceiver<C::ServerMessage, C::ClientMessage>,
-    in_flight: VecDeque<mpsc::Sender<C::ClientMessage>>,
+    outbound: Weak<Inner<C::ServerMessage, C::ClientMessage>>,
+    inbound: ArrayQueue<ResponseSlot<C::ClientMessage>>,
 }
 
 impl<C: Client> Handler for ClientHandler<C> {
@@ -137,8 +196,16 @@ impl<C: Client> Handler for ClientHandler<C> {
 
     fn consume(&mut self, response: Self::In) -> Result<()> {
         trace!("ClientHandler::consume");
-        if let Some(complete) = self.in_flight.pop_front() {
-            drop(complete.send(response));
+        if let Some(inbound) = self.inbound.pop() {
+            inbound.set(response);
+            match self.outbound.upgrade() {
+                Some(outbound) => {
+                    if outbound.inbound_responses.push(inbound).is_err() {
+                        panic!();
+                    }
+                }
+                None => error!("  --> no live proxies"),
+            }
         } else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -152,37 +219,53 @@ impl<C: Client> Handler for ClientHandler<C> {
     fn produce(&mut self) -> Result<Option<Self::Out>> {
         trace!("ClientHandler::produce");
 
-        // Try to get a new message
-        match self.messages.try_recv() {
-            Ok((request, response_tx)) => {
-                trace!("  --> received request");
-                self.in_flight.push_back(response_tx);
-                Ok(Some(request))
+        match self.outbound.upgrade() {
+            Some(outbound) => {
+                // Try to get a new message
+                if let Some((outbound, waiter)) = outbound.outbound.pop() {
+                    trace!("  --> received request");
+                    if self.inbound.push(waiter).is_err() {
+                        panic!();
+                    }
+                    Ok(Some(outbound))
+                } else {
+                    // NOTE(kinetik): this happens once per flush_outbound to detect empty queue
+                    trace!("  --> no request");
+                    Ok(None)
+                }
             }
-            Err(mpsc::TryRecvError::Empty) => {
-                trace!("  --> no request");
-                Ok(None)
-            }
-            Err(e) => {
-                trace!("  --> client disconnected");
-                Err(io::Error::new(io::ErrorKind::ConnectionAborted, e))
+            None => {
+                trace!("  --> no live proxies, destroying ClientHandler");
+                Err(io::ErrorKind::ConnectionAborted.into())
             }
         }
     }
 }
 
 pub(crate) fn make_client<C: Client>(
+    cap: usize,
 ) -> (ClientHandler<C>, Proxy<C::ServerMessage, C::ClientMessage>) {
-    let (tx, rx) = mpsc::channel();
+    let inbound_responses = ArrayQueue::new(cap);
+    for _ in 0..cap {
+        let slot = ResponseSlot::new();
+        if inbound_responses.push(slot).is_err() {
+            panic!();
+        }
+    }
+
+    let inner = Arc::new(Inner {
+        outbound: ArrayQueue::new(cap),
+        inbound_responses,
+    });
 
     let handler = ClientHandler::<C> {
-        messages: rx,
-        in_flight: VecDeque::with_capacity(32),
+        outbound: Arc::downgrade(&inner),
+        inbound: ArrayQueue::new(cap),
     };
 
     let proxy = Proxy {
         handle: None,
-        tx: ManuallyDrop::new(tx),
+        inner: ManuallyDrop::new(inner),
     };
 
     (handler, proxy)
