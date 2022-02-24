@@ -49,10 +49,11 @@ impl CubebDeviceCollectionManager {
     ) -> cubeb::Result<()> {
         server.borrow_mut().devtype.insert(devtype);
         let mut servers = self.servers.lock().unwrap();
+        let do_register = servers.is_empty();
         if !servers.iter().any(|s| Rc::ptr_eq(s, server)) {
             servers.push(server.clone());
         }
-        if servers.len() == 1 {
+        if do_register {
             self.internal_register(context, true)?;
         }
         Ok(())

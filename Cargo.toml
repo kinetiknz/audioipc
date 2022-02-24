@@ -1,3 +1,5 @@
 [workspace]
 members = ["audioipc", "client", "server", "ipctest"]
 
+[patch.crates-io]
+audio_thread_priority = { git = "https://github.com/kinetiknz/audio_thread_priority", rev = "766e13e9be714ef82af8e19acd848d4321194067" }
