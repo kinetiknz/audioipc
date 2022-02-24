@@ -108,7 +108,10 @@ fn enumerate_devices(ctx: &cubeb::Context) -> Result<()> {
     let devices = match ctx.enumerate_devices(cubeb::DeviceType::INPUT) {
         Ok(devices) => devices,
         Err(e) if e.code() == cubeb::ErrorCode::NotSupported => {
-            println!("Device enumeration not supported for '{}' backend.", ctx.backend_id());
+            println!(
+                "Device enumeration not supported for '{}' backend.",
+                ctx.backend_id()
+            );
             return Ok(());
         }
         Err(e) => {
@@ -116,7 +119,11 @@ fn enumerate_devices(ctx: &cubeb::Context) -> Result<()> {
         }
     };
 
-    println!("Found {} input devices for '{}':", devices.len(), ctx.backend_id());
+    println!(
+        "Found {} input devices for '{}':",
+        devices.len(),
+        ctx.backend_id()
+    );
     let mut skipped = 0;
     for d in devices.iter() {
         match d.state() {
@@ -134,7 +141,11 @@ fn enumerate_devices(ctx: &cubeb::Context) -> Result<()> {
         }
     };
 
-    println!("Found {} output devices for '{}':", devices.len(), ctx.backend_id());
+    println!(
+        "Found {} output devices for '{}':",
+        devices.len(),
+        ctx.backend_id()
+    );
     let mut skipped = 0;
     for d in devices.iter() {
         match d.state() {
