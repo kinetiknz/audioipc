@@ -108,7 +108,7 @@ fn enumerate_devices(ctx: &cubeb::Context) -> Result<()> {
     let devices = match ctx.enumerate_devices(cubeb::DeviceType::INPUT) {
         Ok(devices) => devices,
         Err(e) if e.code() == cubeb::ErrorCode::NotSupported => {
-            println!("Device enumeration not support for this backend.");
+            println!("Device enumeration not supported for '{}' backend.", ctx.backend_id());
             return Ok(());
         }
         Err(e) => {
@@ -116,15 +116,16 @@ fn enumerate_devices(ctx: &cubeb::Context) -> Result<()> {
         }
     };
 
-    println!("Found {} input devices", devices.len());
+    println!("Found {} input devices for '{}':", devices.len(), ctx.backend_id());
+    let mut skipped = 0;
     for d in devices.iter() {
-        print_device_info(d);
+        match d.state() {
+            cubeb::DeviceState::Disabled => skipped += 1,
+            cubeb::DeviceState::Unplugged => skipped += 1,
+            _ => print_device_info(d),
+        }
     }
-
-    println!(
-        "Enumerating output devices for backend {}",
-        ctx.backend_id()
-    );
+    println!("...skipped {} unavailable.", skipped);
 
     let devices = match ctx.enumerate_devices(cubeb::DeviceType::OUTPUT) {
         Ok(devices) => devices,
@@ -133,10 +134,16 @@ fn enumerate_devices(ctx: &cubeb::Context) -> Result<()> {
         }
     };
 
-    println!("Found {} output devices", devices.len());
+    println!("Found {} output devices for '{}':", devices.len(), ctx.backend_id());
+    let mut skipped = 0;
     for d in devices.iter() {
-        print_device_info(d);
+        match d.state() {
+            cubeb::DeviceState::Disabled => skipped += 1,
+            cubeb::DeviceState::Unplugged => skipped += 1,
+            _ => print_device_info(d),
+        }
     }
+    println!("...skipped {} unavailable.", skipped);
 
     Ok(())
 }
@@ -222,7 +229,10 @@ pub fn client_test(handle: audioipc::PlatformHandleType) -> Result<()> {
 
     query!(stream.set_volume(1.0));
     query!(stream.start());
-    thread::sleep(Duration::from_millis(500));
+    for _ in 0..10 {
+        println!("position={}", query!(stream.position()));
+        thread::sleep(Duration::from_millis(50));
+    }
     query!(stream.stop());
 
     Ok(())
