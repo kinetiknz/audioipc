@@ -103,6 +103,7 @@ impl<Request, Response> Proxy<Request, Response> {
 
 impl<Request, Response> Clone for Proxy<Request, Response> {
     fn clone(&self) -> Self {
+        assert!(self.handle.is_some());
         Proxy {
             handle: self.handle.clone(),
             inner: self.inner.clone(),
@@ -114,7 +115,7 @@ impl<Request, Response> Drop for Proxy<Request, Response> {
     fn drop(&mut self) {
         trace!("Proxy drop, waking EventLoop");
         let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
-        if Arc::try_unwrap(inner).is_ok() {
+        if self.handle.is_some() && Arc::try_unwrap(inner).is_ok() {
             // Last Proxy alive, wake connection to clean up ClientHandler.
             self.wake_connection();
         }
