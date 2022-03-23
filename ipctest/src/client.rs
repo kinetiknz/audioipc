@@ -10,6 +10,8 @@ use std::ptr;
 use std::thread;
 use std::time::Duration;
 
+use audioipc2_client as audioipc_client;
+
 mod errors {
     #![allow(clippy::upper_case_acronyms)]
     error_chain! {

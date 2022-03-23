@@ -11,6 +11,8 @@ extern crate log;
 
 use std::process::exit;
 
+use audioipc2_server as audioipc_server;
+
 mod client;
 
 mod errors {
@@ -18,7 +20,7 @@ mod errors {
     error_chain! {
         links {
             AudioIPC(::audioipc::errors::Error, ::audioipc::errors::ErrorKind);
-            Server(::audioipc_server::errors::Error, ::audioipc_server::errors::ErrorKind);
+            Server(super::audioipc_server::errors::Error, super::audioipc_server::errors::ErrorKind);
         }
     }
 }
