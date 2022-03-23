@@ -7,8 +7,6 @@
 #[macro_use]
 extern crate log;
 
-extern crate audio_thread_priority;
-
 #[macro_use]
 mod send_recv;
 mod context;

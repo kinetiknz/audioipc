@@ -5,8 +5,6 @@
 
 use crate::PlatformHandle;
 use crate::PlatformHandleType;
-#[cfg(target_os = "linux")]
-use audio_thread_priority::RtPriorityThreadInfo;
 use cubeb::{self, ffi};
 use serde_derive::Deserialize;
 use serde_derive::Serialize;
@@ -226,9 +224,6 @@ pub enum ServerMessage {
     StreamSetName(usize, CString),
     StreamGetCurrentDevice(usize),
     StreamRegisterDeviceChangeCallback(usize, bool),
-
-    #[cfg(target_os = "linux")]
-    PromoteThreadToRealTime([u8; std::mem::size_of::<RtPriorityThreadInfo>()]),
 }
 
 // Server -> Client messages.
@@ -259,9 +254,6 @@ pub enum ClientMessage {
     StreamNameSet,
     StreamCurrentDevice(Device),
     StreamRegisterDeviceChangeCallback,
-
-    #[cfg(target_os = "linux")]
-    ThreadPromoted,
 
     Error(c_int),
 }
