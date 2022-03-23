@@ -10,6 +10,9 @@ extern crate error_chain;
 #[macro_use]
 extern crate log;
 
+#[cfg(target_os = "linux")]
+extern crate audio_thread_priority;
+
 pub mod codec;
 #[allow(deprecated)]
 pub mod errors;

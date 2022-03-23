@@ -9,6 +9,8 @@ extern crate error_chain;
 #[macro_use]
 extern crate log;
 
+extern crate audio_thread_priority;
+
 use audio_thread_priority::promote_current_thread_to_real_time;
 use audioipc::ipccore;
 use audioipc::sys;
