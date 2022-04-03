@@ -38,7 +38,7 @@ enum Request {
     AddConnection(
         sys::Pipe,
         Box<dyn Driver + Send>,
-        mpsc::Sender<Result<Token>>,
+        Option<mpsc::Sender<Result<Token>>>,
     ),
     // See EventLoop::shutdown
     Shutdown,
@@ -67,10 +67,10 @@ impl EventLoopHandle {
     {
         let (handler, mut proxy) = make_client::<C>();
         let driver = Box::new(FramedDriver::new(handler));
-        let r = self.add_connection(connection, driver);
+        let r = self.add_connection(connection, driver, true);
         trace!("EventLoop::bind_client {:?}", r);
         r.map(|token| {
-            proxy.connect_event_loop(self.clone(), token);
+            proxy.connect_event_loop(self.clone(), token.unwrap());
             proxy
         })
     }
@@ -86,28 +86,57 @@ impl EventLoopHandle {
     {
         let handler = make_server::<S>(server);
         let driver = Box::new(FramedDriver::new(handler));
-        let r = self.add_connection(connection, driver);
+        let r = self.add_connection(connection, driver, true);
+        trace!("EventLoop::bind_server {:?}", r);
+        r.map(|_| ())
+    }
+
+    pub fn bind_server_async<S: Server + Send + 'static>(
+        &self,
+        server: S,
+        connection: sys::Pipe,
+    ) -> Result<()>
+    where
+        <S as Server>::ServerMessage: DeserializeOwned + Debug + AssociateHandleForMessage + Send,
+        <S as Server>::ClientMessage: Serialize + Debug + AssociateHandleForMessage + Send,
+    {
+        let handler = make_server::<S>(server);
+        let driver = Box::new(FramedDriver::new(handler));
+        let r = self.add_connection(connection, driver, false);
         trace!("EventLoop::bind_server {:?}", r);
         r.map(|_| ())
     }
 
     // Register a new connection with associated driver on the EventLoop.
-    // TODO: Since this is called from a Gecko main thread, make this non-blocking wrt. the EventLoop.
+    // Set `blocking` to wait for the EventLoop to process the request.  If
+    // `blocking` is true a `Some(Token)` is returned on success; if false
+    //  `None` is returned and the EventLoop will process the request asynchronously.
     fn add_connection(
         &self,
         connection: sys::Pipe,
         driver: Box<dyn Driver + Send>,
-    ) -> Result<Token> {
-        assert_not_in_event_loop_thread();
-        let (tx, rx) = mpsc::channel();
-        self.requests_tx
-            .send(Request::AddConnection(connection, driver, tx))
-            .map_err(|_| {
-                debug!("EventLoopHandle::add_connection send failed");
-                io::ErrorKind::ConnectionAborted
-            })?;
+        blocking: bool,
+    ) -> Result<Option<Token>> {
+        let (req, rx) = if blocking {
+            assert_not_in_event_loop_thread();
+            let (tx, rx) = mpsc::channel();
+            (
+                Request::AddConnection(connection, driver, Some(tx)),
+                Some(rx),
+            )
+        } else {
+            (Request::AddConnection(connection, driver, None), None)
+        };
+
+        self.requests_tx.send(req).map_err(|_| {
+            debug!("EventLoopHandle::add_connection send failed");
+            io::ErrorKind::ConnectionAborted
+        })?;
         self.waker.wake()?;
-        rx.recv().map_err(|_| {
+        if !blocking {
+            return Ok(None);
+        }
+        rx.unwrap().recv().map(|r| r.map(Some)).map_err(|_| {
             debug!("EventLoopHandle::add_connection recv failed");
             io::ErrorKind::ConnectionAborted
         })?
@@ -251,7 +280,9 @@ impl EventLoop {
                 Request::AddConnection(pipe, driver, tx) => {
                     debug!("{}: EventLoop: handling add_connection", self.name);
                     let r = self.add_connection(pipe, driver);
-                    tx.send(r).expect("EventLoop::add_connection");
+                    if let Some(tx) = tx {
+                        tx.send(r).expect("EventLoop::add_connection");
+                    }
                 }
                 Request::Shutdown => {
                     debug!("{}: EventLoop: handling shutdown", self.name);
