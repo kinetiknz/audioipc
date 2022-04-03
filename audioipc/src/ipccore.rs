@@ -98,6 +98,22 @@ impl EventLoopHandle {
         r.map(|_| ())
     }
 
+    pub fn bind_server_async<S: Server + Send + 'static>(
+        &self,
+        server: S,
+        connection: sys::Pipe,
+    ) -> Result<()>
+    where
+        <S as Server>::ServerMessage: DeserializeOwned + Debug + AssociateHandleForMessage + Send,
+        <S as Server>::ClientMessage: Serialize + Debug + AssociateHandleForMessage + Send,
+    {
+        let handler = make_server::<S>(server);
+        let driver = Box::new(FramedDriver::new(handler));
+        let r = self.add_connection_async(connection, driver);
+        trace!("EventLoop::bind_server {:?}", r);
+        r.map(|_| ())
+    }
+
     // Register a new connection with associated driver on the EventLoop.
     // TODO: Since this is called from a Gecko main thread, make this non-blocking wrt. the EventLoop.
     fn add_connection(
@@ -118,6 +134,23 @@ impl EventLoopHandle {
             debug!("EventLoopHandle::add_connection recv failed");
             io::ErrorKind::ConnectionAborted
         })?
+    }
+
+    fn add_connection_async(
+        &self,
+        connection: sys::Pipe,
+        driver: Box<dyn Driver + Send>,
+    ) -> Result<()> {
+        assert_not_in_event_loop_thread();
+        let (tx, _) = mpsc::channel();
+        self.requests_tx
+            .send(Request::AddConnection(connection, driver, tx))
+            .map_err(|_| {
+                debug!("EventLoopHandle::add_connection send failed");
+                io::ErrorKind::ConnectionAborted
+            })?;
+        self.waker.wake()?;
+        Ok(())
     }
 
     // Signal EventLoop to shutdown.  Causes EventLoop::poll to return Ok(false).
@@ -258,7 +291,7 @@ impl EventLoop {
                 Request::AddConnection(pipe, driver, tx) => {
                     debug!("{}: EventLoop: handling add_connection", self.name);
                     let r = self.add_connection(pipe, driver);
-                    tx.send(r).expect("EventLoop::add_connection");
+                    let _ = tx.send(r);
                 }
                 Request::Shutdown => {
                     debug!("{}: EventLoop: handling shutdown", self.name);
