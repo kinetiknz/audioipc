@@ -6,7 +6,7 @@
 use std::io::Result;
 use std::os::unix::prelude::{AsRawFd, FromRawFd, RawFd};
 
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use iovec::IoVec;
 use mio::net::UnixStream;
 
@@ -50,8 +50,10 @@ impl RecvMsg for Pipe {
         #[cfg(not(target_os = "linux"))]
         let flags = 0;
         let r = unsafe {
-            let mut iovec = [<&mut IoVec>::from(buf.buf.bytes_mut())];
-            msg::recv_msg_with_flags(self.0.as_raw_fd(), &mut iovec, buf.cmsg.bytes_mut(), flags)
+            let chunk = buf.buf.chunk_mut();
+            let slice = std::slice::from_raw_parts_mut(chunk.as_mut_ptr(), chunk.len());
+            let mut iovec = [<&mut IoVec>::from(slice)];
+            msg::recv_msg_with_flags(self.0.as_raw_fd(), &mut iovec, buf.cmsg.chunk_mut(), flags)
         };
         match r {
             Ok((n, cmsg_n, msg_flags)) => unsafe {

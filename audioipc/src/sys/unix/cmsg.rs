@@ -87,14 +87,14 @@ impl Iterator for ControlMsgIter {
                 // complete message.
                 Bytes::new()
             } else {
-                control.slice_from(cmsg_space)
+                control.slice(cmsg_space..)
             };
 
             match (cmsg.cmsg_level, cmsg.cmsg_type) {
                 (libc::SOL_SOCKET, libc::SCM_RIGHTS) => {
                     trace!("Found SCM_RIGHTS...");
                     return Some(Fds {
-                        fds: control.slice(cmsghdr_len, cmsg_len as _),
+                        fds: control.slice(cmsghdr_len..cmsg_len),
                     });
                 }
                 (level, kind) => {
@@ -145,7 +145,7 @@ impl ControlMsgBuilder {
             };
 
             unsafe {
-                let cmsghdr_ptr = cmsg.bytes_mut().as_mut_ptr();
+                let cmsghdr_ptr = cmsg.chunk_mut().as_mut_ptr();
                 std::ptr::copy_nonoverlapping(
                     &cmsghdr as *const _ as *const _,
                     cmsghdr_ptr,
@@ -167,7 +167,7 @@ impl ControlMsgBuilder {
     }
 
     pub fn finish(self) -> Result<Bytes, Error> {
-        self.result.map(|mut cmsg| cmsg.take().freeze())
+        self.result.map(|mut cmsg| cmsg.split().freeze())
     }
 }
 
@@ -187,10 +187,10 @@ fn aligned(buf: &BytesMut) -> BytesMut {
     let mut aligned_buf = buf.clone();
     aligned_buf.reserve(buf.remaining_mut());
     let cmsghdr_align = mem::align_of::<cmsghdr>();
-    let n = unsafe { aligned_buf.bytes_mut().as_ptr() } as usize & (cmsghdr_align - 1);
+    let n = aligned_buf.chunk_mut().as_mut_ptr() as usize & (cmsghdr_align - 1);
     if n != 0 {
         unsafe { aligned_buf.advance_mut(n) };
-        drop(aligned_buf.take());
+        drop(aligned_buf.split());
     }
     aligned_buf
 }
