@@ -5,8 +5,8 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Result};
-use std::mem::ManuallyDrop;
-use std::sync::{Arc, Weak};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use crossbeam::queue::ArrayQueue;
 use mio::Token;
@@ -71,20 +71,19 @@ impl<Response> ProxyResponse<Response> {
 // `wait`ing on the returned ProxyResponse.
 #[derive(Debug)]
 pub struct Proxy<Request, Response> {
-    inner: ManuallyDrop<Arc<Inner<Request, Response>>>,
+    inner: Arc<Inner<Request, Response>>,
     handle: Option<(EventLoopHandle, Token)>,
 }
 
 impl<Request, Response> Proxy<Request, Response> {
     pub fn call(&self, request: Request) -> ProxyResponse<Response> {
-        // If inner's weak_count is zero, the ClientHandler has dropped its reference.
-        if Arc::weak_count(&self.inner) == 0 {
-            return ProxyResponse { response: None };
-        }
-        let slot = self.inner.send(request);
-        self.wake_connection();
-        ProxyResponse {
-            response: Some(slot),
+        if let Some(slot) = self.inner.send(request) {
+            self.wake_connection();
+            ProxyResponse {
+                response: Some(slot),
+            }
+        } else {
+            ProxyResponse { response: None }
         }
     }
 
@@ -104,6 +103,7 @@ impl<Request, Response> Proxy<Request, Response> {
 impl<Request, Response> Clone for Proxy<Request, Response> {
     fn clone(&self) -> Self {
         assert!(self.handle.is_some());
+        self.inner.proxy_count.fetch_add(1, Ordering::SeqCst);
         Proxy {
             handle: self.handle.clone(),
             inner: self.inner.clone(),
@@ -113,10 +113,10 @@ impl<Request, Response> Clone for Proxy<Request, Response> {
 
 impl<Request, Response> Drop for Proxy<Request, Response> {
     fn drop(&mut self) {
-        trace!("Proxy drop, waking EventLoop");
-        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
-        if self.handle.is_some() && Arc::try_unwrap(inner).is_ok() {
+        let count = self.inner.proxy_count.fetch_sub(1, Ordering::SeqCst);
+        if count == 1 && self.handle.is_some() {
             // Last Proxy alive, wake connection to clean up ClientHandler.
+            trace!("Proxy drop, waking EventLoop");
             self.wake_connection();
         }
     }
@@ -166,13 +166,23 @@ impl<Response> Drop for ResponseSlot<Response> {
 struct Inner<Request, Response> {
     outbound: ArrayQueue<(Request, ResponseSlot<Response>)>,
     inbound_responses: ArrayQueue<ResponseSlot<Response>>,
+    handler_active: AtomicBool,
+    proxy_count: AtomicUsize,
 }
 
 impl<Request, Response> Inner<Request, Response> {
-    fn send(&self, request: Request) -> ResponseSlot<Response> {
-        let slot = self.inbound_responses.pop().unwrap();
-        if self.outbound.push((request, slot.clone())).is_err() {
-            panic!()
+    fn send(&self, request: Request) -> Option<ResponseSlot<Response>> {
+        if !self.handler_active.load(Ordering::SeqCst) {
+            return None;
+        }
+        let slot = self.inbound_responses.pop();
+        if let Some(ref slot) = slot {
+            if self.outbound.push((request, slot.clone())).is_err() {
+                if self.inbound_responses.push(slot.clone()).is_err() {
+                    panic!("out of memory");
+                }
+                return None;
+            }
         }
         slot
     }
@@ -186,8 +196,14 @@ impl<Request, Response> Inner<Request, Response> {
 // trigger response completion by sending the response via a channel
 // connected to a ProxyResponse.
 pub(crate) struct ClientHandler<C: Client> {
-    outbound: Weak<Inner<C::ServerMessage, C::ClientMessage>>,
-    inbound: ArrayQueue<ResponseSlot<C::ClientMessage>>,
+    inner: Arc<Inner<C::ServerMessage, C::ClientMessage>>,
+    inflight: ArrayQueue<ResponseSlot<C::ClientMessage>>,
+}
+
+impl<C: Client> Drop for ClientHandler<C> {
+    fn drop(&mut self) {
+        self.inner.handler_active.store(false, Ordering::SeqCst);
+    }
 }
 
 impl<C: Client> Handler for ClientHandler<C> {
@@ -196,15 +212,10 @@ impl<C: Client> Handler for ClientHandler<C> {
 
     fn consume(&mut self, response: Self::In) -> Result<()> {
         trace!("ClientHandler::consume");
-        if let Some(inbound) = self.inbound.pop() {
-            inbound.set(response);
-            match self.outbound.upgrade() {
-                Some(outbound) => {
-                    if outbound.inbound_responses.push(inbound).is_err() {
-                        panic!();
-                    }
-                }
-                None => error!("  --> no live proxies"),
+        if let Some(slot) = self.inflight.pop() {
+            slot.set(response);
+            if self.inner.inbound_responses.push(slot).is_err() {
+                panic!("out of memory");
             }
         } else {
             return Err(std::io::Error::new(
@@ -219,25 +230,21 @@ impl<C: Client> Handler for ClientHandler<C> {
     fn produce(&mut self) -> Result<Option<Self::Out>> {
         trace!("ClientHandler::produce");
 
-        match self.outbound.upgrade() {
-            Some(outbound) => {
-                // Try to get a new message
-                if let Some((outbound, waiter)) = outbound.outbound.pop() {
-                    trace!("  --> received request");
-                    if self.inbound.push(waiter).is_err() {
-                        panic!();
-                    }
-                    Ok(Some(outbound))
-                } else {
-                    // NOTE(kinetik): this happens once per flush_outbound to detect empty queue
-                    trace!("  --> no request");
-                    Ok(None)
-                }
+        if self.inner.proxy_count.load(Ordering::SeqCst) == 0 {
+            trace!("  --> no live proxies, destroying ClientHandler");
+            return Err(io::ErrorKind::ConnectionAborted.into());
+        }
+        // Try to get a new message
+        if let Some((outbound, waiter)) = self.inner.outbound.pop() {
+            trace!("  --> received request");
+            if self.inflight.push(waiter).is_err() {
+                panic!("out of memory");
             }
-            None => {
-                trace!("  --> no live proxies, destroying ClientHandler");
-                Err(io::ErrorKind::ConnectionAborted.into())
-            }
+            Ok(Some(outbound))
+        } else {
+            // NOTE(kinetik): this happens once per flush_outbound to detect empty queue
+            trace!("  --> no request");
+            Ok(None)
         }
     }
 }
@@ -249,23 +256,25 @@ pub(crate) fn make_client<C: Client>(
     for _ in 0..cap {
         let slot = ResponseSlot::new();
         if inbound_responses.push(slot).is_err() {
-            panic!();
+            panic!("out of memory")
         }
     }
 
     let inner = Arc::new(Inner {
         outbound: ArrayQueue::new(cap),
         inbound_responses,
+        handler_active: AtomicBool::new(true),
+        proxy_count: AtomicUsize::new(1),
     });
 
     let handler = ClientHandler::<C> {
-        outbound: Arc::downgrade(&inner),
-        inbound: ArrayQueue::new(cap),
+        inner: inner.clone(),
+        inflight: ArrayQueue::new(cap),
     };
 
     let proxy = Proxy {
         handle: None,
-        inner: ManuallyDrop::new(inner),
+        inner,
     };
 
     (handler, proxy)
