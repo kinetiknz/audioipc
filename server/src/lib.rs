@@ -14,6 +14,7 @@ use audioipc::ipccore;
 use audioipc::sys;
 use audioipc::PlatformHandleType;
 use once_cell::sync::Lazy;
+use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 use std::ptr;
@@ -94,22 +95,33 @@ fn init_threads(
 
     let callback_name = "AudioIPC Server Callback";
     let callback_thread =
-        ipccore::EventLoopThread::new(callback_name.to_string(), None, move |state| match state {
-            ipccore::EventLoopState::Start => {
-                trace!("Starting {} thread", callback_name);
-                if let Err(e) = promote_current_thread_to_real_time(256, 48000) {
-                    debug!(
-                        "Failed to promote {} thread to real-time: {:?}",
-                        callback_name, e
-                    );
+        ipccore::EventLoopThread::new(callback_name.to_string(), None, move |state| {
+            thread_local! {
+                static HANDLE: RefCell<Option<audio_thread_priority::RtPriorityHandle>>  = RefCell::new(None);
+            }
+            match state {
+                ipccore::EventLoopState::Start => {
+                    trace!("Starting {} thread", callback_name);
+                    HANDLE.with(|h| *h.borrow_mut() = promote_current_thread_to_real_time(256, 48000).ok());
+                    register_thread(thread_create_callback);
                 }
-                register_thread(thread_create_callback);
+                ipccore::EventLoopState::Stop => {
+                    unregister_thread(thread_destroy_callback);
+                    trace!("Stopping {} thread", callback_name);
+                }
+                ipccore::EventLoopState::Idle => {
+                    eprintln!("demote");
+                    HANDLE.with(|h|
+                        if let Some(h) = h.borrow_mut().take() {
+                            let _ = audio_thread_priority::demote_current_thread_from_real_time(h);
+                        }
+                    );
+                },
+                ipccore::EventLoopState::Active => {
+                    eprintln!("promote");
+                    HANDLE.with(|h| *h.borrow_mut() = audio_thread_priority::promote_current_thread_to_real_time(256, 48000).ok());
+                },
             }
-            ipccore::EventLoopState::Stop => {
-                unregister_thread(thread_destroy_callback);
-                trace!("Stopping {} thread", callback_name);
-            }
-            _ => (),
         })
         .map_err(|e| {
             debug!("Failed to start {} thread: {:?}", callback_name, e);

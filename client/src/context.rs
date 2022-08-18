@@ -20,6 +20,7 @@ use cubeb_backend::{
     capi_new, ffi, Context, ContextOps, DeviceCollectionRef, DeviceId, DeviceType, Error, Ops,
     Result, Stream, StreamParams, StreamParamsRef,
 };
+use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 use std::sync::{Arc, Mutex};
@@ -67,7 +68,9 @@ impl ClientContext {
 }
 
 #[cfg(target_os = "linux")]
-fn promote_thread(rpc: &rpccore::Proxy<ServerMessage, ClientMessage>) {
+fn promote_thread(
+    rpc: &rpccore::Proxy<ServerMessage, ClientMessage>,
+) -> Option<audio_thread_priority::RtPriorityHandle> {
     match get_current_thread_info() {
         Ok(info) => {
             let bytes = info.serialize();
@@ -78,16 +81,21 @@ fn promote_thread(rpc: &rpccore::Proxy<ServerMessage, ClientMessage>) {
             warn!("Could not remotely promote thread to RT.");
         }
     }
+    None
 }
 
 #[cfg(not(target_os = "linux"))]
-fn promote_thread(_rpc: &rpccore::Proxy<ServerMessage, ClientMessage>) {
+fn promote_thread(
+    _rpc: &rpccore::Proxy<ServerMessage, ClientMessage>,
+) -> Option<audio_thread_priority::RtPriorityHandle> {
     match promote_current_thread_to_real_time(256, 48000) {
-        Ok(_) => {
+        Ok(handle) => {
             info!("Audio thread promoted to real-time.");
+            Some(handle)
         }
         Err(_) => {
             warn!("Could not promote thread to real-time.");
+            None
         }
     }
 }
@@ -104,14 +112,6 @@ fn unregister_thread(callback: Option<extern "C" fn()>) {
     if let Some(func) = callback {
         func();
     }
-}
-
-fn promote_and_register_thread(
-    rpc: &rpccore::Proxy<ServerMessage, ClientMessage>,
-    callback: Option<extern "C" fn(*const ::std::os::raw::c_char)>,
-) {
-    promote_thread(rpc);
-    register_thread(callback);
 }
 
 #[derive(Default)]
@@ -181,8 +181,7 @@ impl ContextOps for ClientContext {
                 match state {
                     ipccore::EventLoopState::Start => register_thread(thread_create_callback),
                     ipccore::EventLoopState::Stop => unregister_thread(thread_destroy_callback),
-                    ipccore::EventLoopState::Idle => todo!(),
-                    ipccore::EventLoopState::Active => todo!(),
+                    _ => (),
                 }
             })
             .map_err(|_| Error::default())?;
@@ -204,13 +203,27 @@ impl ContextOps for ClientContext {
         let callback_thread = ipccore::EventLoopThread::new(
             "AudioIPC Client Callback".to_string(),
             Some(params.stack_size),
-            move |state| match state {
-                ipccore::EventLoopState::Start => {
-                    promote_and_register_thread(&rpc2, thread_create_callback)
+            move |state| {
+                thread_local! {
+                    static HANDLE: RefCell<Option<audio_thread_priority::RtPriorityHandle>>  = RefCell::new(None);
                 }
-                ipccore::EventLoopState::Stop => unregister_thread(thread_destroy_callback),
-                ipccore::EventLoopState::Idle => todo!(),
-                ipccore::EventLoopState::Active => todo!(),
+                match state {
+                    ipccore::EventLoopState::Start => {
+                        HANDLE.with(|h| *h.borrow_mut() = promote_thread(&rpc2));
+                        register_thread(thread_create_callback);
+                    }
+                    ipccore::EventLoopState::Stop => unregister_thread(thread_destroy_callback),
+                    ipccore::EventLoopState::Idle => {
+                        HANDLE.with(|h|
+                            if let Some(h) = h.borrow_mut().take() {
+                                let _ = audio_thread_priority::demote_current_thread_from_real_time(h);
+                            }
+                        );
+                    },
+                    ipccore::EventLoopState::Active => {
+                        HANDLE.with(|h| *h.borrow_mut() = audio_thread_priority::promote_current_thread_to_real_time(256, 48000).ok());
+                    },
+                }
             },
         )
         .map_err(|_| Error::default())?;
