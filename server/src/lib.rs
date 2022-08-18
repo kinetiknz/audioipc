@@ -74,65 +74,67 @@ fn init_threads(
     thread_destroy_callback: Option<extern "C" fn()>,
 ) -> Result<ServerWrapper> {
     let rpc_name = "AudioIPC Server RPC";
-    let rpc_thread = ipccore::EventLoopThread::new(
-        rpc_name.to_string(),
-        None,
-        move || {
-            trace!("Starting {} thread", rpc_name);
-            register_thread(thread_create_callback);
-            audioipc::server_platform_init();
-        },
-        move || {
-            unregister_thread(thread_destroy_callback);
-            trace!("Stopping {} thread", rpc_name);
-        },
-    )
-    .map_err(|e| {
-        debug!("Failed to start {} thread: {:?}", rpc_name, e);
-        e
-    })?;
+    let rpc_thread =
+        ipccore::EventLoopThread::new(rpc_name.to_string(), None, move |state| match state {
+            ipccore::EventLoopState::Start => {
+                trace!("Starting {} thread", rpc_name);
+                register_thread(thread_create_callback);
+                audioipc::server_platform_init();
+            }
+            ipccore::EventLoopState::Stop => {
+                unregister_thread(thread_destroy_callback);
+                trace!("Stopping {} thread", rpc_name);
+            }
+            _ => (),
+        })
+        .map_err(|e| {
+            debug!("Failed to start {} thread: {:?}", rpc_name, e);
+            e
+        })?;
 
     let callback_name = "AudioIPC Server Callback";
-    let callback_thread = ipccore::EventLoopThread::new(
-        callback_name.to_string(),
-        None,
-        move || {
-            trace!("Starting {} thread", callback_name);
-            if let Err(e) = promote_current_thread_to_real_time(256, 48000) {
-                debug!(
-                    "Failed to promote {} thread to real-time: {:?}",
-                    callback_name, e
-                );
+    let callback_thread =
+        ipccore::EventLoopThread::new(callback_name.to_string(), None, move |state| match state {
+            ipccore::EventLoopState::Start => {
+                trace!("Starting {} thread", callback_name);
+                if let Err(e) = promote_current_thread_to_real_time(256, 48000) {
+                    debug!(
+                        "Failed to promote {} thread to real-time: {:?}",
+                        callback_name, e
+                    );
+                }
+                register_thread(thread_create_callback);
             }
-            register_thread(thread_create_callback);
-        },
-        move || {
-            unregister_thread(thread_destroy_callback);
-            trace!("Stopping {} thread", callback_name);
-        },
-    )
-    .map_err(|e| {
-        debug!("Failed to start {} thread: {:?}", callback_name, e);
-        e
-    })?;
+            ipccore::EventLoopState::Stop => {
+                unregister_thread(thread_destroy_callback);
+                trace!("Stopping {} thread", callback_name);
+            }
+            _ => (),
+        })
+        .map_err(|e| {
+            debug!("Failed to start {} thread: {:?}", callback_name, e);
+            e
+        })?;
 
     let device_collection_name = "AudioIPC DeviceCollection RPC";
-    let device_collection_thread = ipccore::EventLoopThread::new(
-        device_collection_name.to_string(),
-        None,
-        move || {
-            trace!("Starting {} thread", device_collection_name);
-            register_thread(thread_create_callback);
-        },
-        move || {
-            unregister_thread(thread_destroy_callback);
-            trace!("Stopping {} thread", device_collection_name);
-        },
-    )
-    .map_err(|e| {
-        debug!("Failed to start {} thread: {:?}", device_collection_name, e);
-        e
-    })?;
+    let device_collection_thread =
+        ipccore::EventLoopThread::new(device_collection_name.to_string(), None, move |state| {
+            match state {
+                ipccore::EventLoopState::Start => {
+                    trace!("Starting {} thread", device_collection_name);
+                    register_thread(thread_create_callback);
+                }
+                ipccore::EventLoopState::Stop => {
+                    unregister_thread(thread_destroy_callback);
+                    trace!("Stopping {} thread", device_collection_name);
+                }
+                _ => (),
+            }
+        })
+        .map_err(|e| {
+            debug!("Failed to start {} thread: {:?}", device_collection_name, e);
+            e
+        })?;
 
     Ok(ServerWrapper {
         rpc_thread,

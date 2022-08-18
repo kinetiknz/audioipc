@@ -165,6 +165,14 @@ impl EventLoop {
         Ok(eventloop)
     }
 
+    fn get_state(&self) -> EventLoopState {
+        if self.connections.is_empty() {
+            EventLoopState::Idle
+        } else {
+            EventLoopState::Active
+        }
+    }
+
     // Return a cloneable handle for controlling the EventLoop externally.
     fn handle(&mut self) -> EventLoopHandle {
         EventLoopHandle {
@@ -669,6 +677,14 @@ impl<T: Handler> FramedDriver<T> {
     }
 }
 
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum EventLoopState {
+    Start,
+    Stop,
+    Idle,
+    Active,
+}
+
 #[derive(Debug)]
 pub struct EventLoopThread {
     thread: Option<thread::JoinHandle<Result<()>>>,
@@ -677,15 +693,9 @@ pub struct EventLoopThread {
 }
 
 impl EventLoopThread {
-    pub fn new<F1, F2>(
-        name: String,
-        stack_size: Option<usize>,
-        after_start: F1,
-        before_stop: F2,
-    ) -> Result<Self>
+    pub fn new<F>(name: String, stack_size: Option<usize>, on_state_change: F) -> Result<Self>
     where
-        F1: Fn() + Send + 'static,
-        F2: Fn() + Send + 'static,
+        F: Fn(EventLoopState) + Send + 'static,
     {
         let mut event_loop = EventLoop::new(name.clone())?;
         let handle = event_loop.handle();
@@ -696,10 +706,17 @@ impl EventLoopThread {
 
         let thread = builder.spawn(move || {
             trace!("{}: event loop thread enter", event_loop.name);
-            after_start();
-            let _thread_exit_guard = scopeguard::guard((), |_| before_stop());
+            on_state_change(EventLoopState::Start);
+            let _thread_exit_guard =
+                scopeguard::guard((), |_| on_state_change(EventLoopState::Stop));
 
+            let mut last_state = EventLoopState::Active;
             let r = loop {
+                let state = event_loop.get_state();
+                if state != last_state {
+                    on_state_change(state);
+                    last_state = state;
+                }
                 let start = std::time::Instant::now();
                 let r = event_loop.poll();
                 trace!(
@@ -793,7 +810,7 @@ mod test {
         Proxy<TestServerMessage, TestClientMessage>,
     ) {
         // Server setup and registration.
-        let server = EventLoopThread::new("test-server".to_string(), None, || {}, || {})
+        let server = EventLoopThread::new("test-server".to_string(), None, |_| {})
             .expect("server EventLoopThread");
         let server_handle = server.handle();
 
@@ -803,7 +820,7 @@ mod test {
             .expect("server bind_server");
 
         // Client setup and registration.
-        let client = EventLoopThread::new("test-client".to_string(), None, || {}, || {})
+        let client = EventLoopThread::new("test-client".to_string(), None, |_| {})
             .expect("client EventLoopThread");
         let client_handle = client.handle();
 
@@ -871,7 +888,7 @@ mod test {
     #[test]
     fn disconnected_handle() {
         init();
-        let server = EventLoopThread::new("test-server".to_string(), None, || {}, || {})
+        let server = EventLoopThread::new("test-server".to_string(), None, |_| {})
             .expect("server EventLoopThread");
         let server_handle = server.handle().clone();
         drop(server);
@@ -887,18 +904,22 @@ mod test {
         let (start_tx, start_rx) = mpsc::channel();
         let (stop_tx, stop_rx) = mpsc::channel();
 
-        let elt = EventLoopThread::new(
-            "test-thread-callbacks".to_string(),
-            None,
-            move || start_tx.send(()).unwrap(),
-            move || stop_tx.send(()).unwrap(),
-        )
-        .expect("server EventLoopThread");
+        let elt =
+            EventLoopThread::new(
+                "test-thread-callbacks".to_string(),
+                None,
+                move |state| match state {
+                    EventLoopState::Start => start_tx.send(()).unwrap(),
+                    EventLoopState::Stop => stop_tx.send(()).unwrap(),
+                    _ => (),
+                },
+            )
+            .expect("server EventLoopThread");
 
-        start_rx.recv().expect("after_start callback done");
+        start_rx.recv().expect("thread start callback done");
 
         drop(elt);
 
-        stop_rx.recv().expect("before_stop callback done");
+        stop_rx.recv().expect("thread stop callback done");
     }
 }

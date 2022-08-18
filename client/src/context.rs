@@ -176,13 +176,16 @@ impl ContextOps for ClientContext {
         let server_connection =
             unsafe { sys::Pipe::from_raw_handle(PlatformHandle::new(params.server_connection)) };
 
-        let rpc_thread = ipccore::EventLoopThread::new(
-            "AudioIPC Client RPC".to_string(),
-            None,
-            move || register_thread(thread_create_callback),
-            move || unregister_thread(thread_destroy_callback),
-        )
-        .map_err(|_| Error::default())?;
+        let rpc_thread =
+            ipccore::EventLoopThread::new("AudioIPC Client RPC".to_string(), None, move |state| {
+                match state {
+                    ipccore::EventLoopState::Start => register_thread(thread_create_callback),
+                    ipccore::EventLoopState::Stop => unregister_thread(thread_destroy_callback),
+                    ipccore::EventLoopState::Idle => todo!(),
+                    ipccore::EventLoopState::Active => todo!(),
+                }
+            })
+            .map_err(|_| Error::default())?;
         let rpc = rpc_thread
             .handle()
             .bind_client::<CubebClient>(server_connection)
@@ -201,8 +204,14 @@ impl ContextOps for ClientContext {
         let callback_thread = ipccore::EventLoopThread::new(
             "AudioIPC Client Callback".to_string(),
             Some(params.stack_size),
-            move || promote_and_register_thread(&rpc2, thread_create_callback),
-            move || unregister_thread(thread_destroy_callback),
+            move |state| match state {
+                ipccore::EventLoopState::Start => {
+                    promote_and_register_thread(&rpc2, thread_create_callback)
+                }
+                ipccore::EventLoopState::Stop => unregister_thread(thread_destroy_callback),
+                ipccore::EventLoopState::Idle => todo!(),
+                ipccore::EventLoopState::Active => todo!(),
+            },
         )
         .map_err(|_| Error::default())?;
 
