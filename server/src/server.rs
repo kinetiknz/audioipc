@@ -270,7 +270,7 @@ impl ServerStreamCallbacks {
             }
             _ => {
                 debug!("Unexpected message {:?} during data_callback", r);
-                cubeb::ffi::CUBEB_ERROR.try_into().unwrap()
+                0//cubeb::ffi::CUBEB_ERROR.try_into().unwrap()
             }
         }
     }
