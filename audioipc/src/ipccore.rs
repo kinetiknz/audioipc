@@ -7,9 +7,9 @@ use std::io::{self, Result};
 use std::sync::{mpsc, Arc};
 use std::thread;
 
-use crossbeam_channel::{self, Receiver, Sender};
 use mio::{event::Event, Events, Interest, Poll, Registry, Token, Waker};
 use slab::Slab;
+use std::sync::mpsc::{Receiver, SyncSender};
 
 use crate::messages::AssociateHandleForMessage;
 use crate::rpccore::{make_client, make_server, Client, Handler, Proxy, Server};
@@ -54,7 +54,7 @@ enum Request {
 #[derive(Clone, Debug)]
 pub struct EventLoopHandle {
     waker: Arc<Waker>,
-    requests_tx: Sender<Request>,
+    requests_tx: SyncSender<Request>,
 }
 
 impl EventLoopHandle {
@@ -142,7 +142,7 @@ struct EventLoop {
     name: String,
     connections: Slab<Connection>,
     requests_rx: Receiver<Request>,
-    requests_tx: Sender<Request>,
+    requests_tx: SyncSender<Request>,
 }
 
 const EVENT_LOOP_INITIAL_CLIENTS: usize = 64; // Initial client allocation, exceeding this will cause the connection slab to grow.
@@ -152,7 +152,7 @@ impl EventLoop {
     fn new(name: String) -> Result<EventLoop> {
         let poll = Poll::new()?;
         let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);
-        let (tx, rx) = crossbeam_channel::bounded(EVENT_LOOP_INITIAL_CLIENTS);
+        let (tx, rx) = mpsc::sync_channel(EVENT_LOOP_INITIAL_CLIENTS);
         let eventloop = EventLoop {
             poll,
             events: Events::with_capacity(EVENT_LOOP_EVENTS_PER_ITERATION),

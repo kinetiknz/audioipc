@@ -8,9 +8,9 @@ use std::io::{self, Error, ErrorKind, Result};
 use std::mem::ManuallyDrop;
 use std::sync::{Arc, Mutex};
 
-use crossbeam_channel::{self, Receiver, Sender};
 use mio::Token;
 use slab::Slab;
+use std::sync::mpsc::{self, Receiver, SyncSender};
 
 use crate::ipccore::EventLoopHandle;
 
@@ -64,16 +64,16 @@ pub struct Proxy<Request, Response> {
     handle: Option<(EventLoopHandle, Token)>,
     key: ProxyKey,
     response_rx: Receiver<Response>,
-    handler_tx: ManuallyDrop<Sender<ProxyRequest<Request>>>,
+    handler_tx: ManuallyDrop<SyncSender<ProxyRequest<Request>>>,
     proxy_mgr: Arc<ProxyManager<Response>>,
 }
 
 impl<Request, Response> Proxy<Request, Response> {
     fn new(
-        handler_tx: Sender<ProxyRequest<Request>>,
+        handler_tx: SyncSender<ProxyRequest<Request>>,
         proxy_mgr: Arc<ProxyManager<Response>>,
     ) -> Result<Self> {
-        let (tx, rx) = crossbeam_channel::bounded(1);
+        let (tx, rx) = mpsc::sync_channel(1);
         Ok(Self {
             handle: None,
             key: proxy_mgr.register_proxy(tx)?,
@@ -138,7 +138,7 @@ const RPC_CLIENT_INITIAL_PROXIES: usize = 32; // Initial proxy pre-allocation pe
 // the manager on initialization.
 #[derive(Debug)]
 struct ProxyManager<Response> {
-    proxies: Mutex<Option<Slab<Sender<Response>>>>,
+    proxies: Mutex<Option<Slab<SyncSender<Response>>>>,
 }
 
 impl<Response> ProxyManager<Response> {
@@ -150,7 +150,7 @@ impl<Response> ProxyManager<Response> {
 
     // Register a Proxy's response Sender, returning a unique ID identifying
     // the Proxy to the ClientHandler.
-    fn register_proxy(&self, tx: Sender<Response>) -> Result<ProxyKey> {
+    fn register_proxy(&self, tx: SyncSender<Response>) -> Result<ProxyKey> {
         let mut proxies = self.proxies.lock().unwrap();
         match &mut *proxies {
             Some(proxies) => {
@@ -263,7 +263,7 @@ impl<C: Client> Handler for ClientHandler<C> {
                 self.in_flight.push_back(proxy);
                 Ok(Some(request))
             }
-            Err(crossbeam_channel::TryRecvError::Empty) => {
+            Err(mpsc::TryRecvError::Empty) => {
                 trace!("  --> no request");
                 Ok(None)
             }
@@ -284,7 +284,7 @@ impl<C: Client> Drop for ClientHandler<C> {
 #[allow(clippy::type_complexity)]
 pub(crate) fn make_client<C: Client>(
 ) -> Result<(ClientHandler<C>, Proxy<C::ServerMessage, C::ClientMessage>)> {
-    let (tx, rx) = crossbeam_channel::bounded(RPC_CLIENT_INITIAL_PROXIES);
+    let (tx, rx) = mpsc::sync_channel(RPC_CLIENT_INITIAL_PROXIES);
 
     let handler = ClientHandler::new(rx);
     let proxy_mgr = handler.proxy_manager().clone();
