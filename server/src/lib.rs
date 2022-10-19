@@ -70,83 +70,95 @@ fn unregister_thread(callback: Option<extern "C" fn()>) {
     }
 }
 
+enum ThreadPriority {
+    Normal,
+    RealTime,
+}
+
+fn on_thread_state_change(
+    priority: ThreadPriority,
+    state: ipccore::EventLoopState,
+    thread_create_callback: Option<extern "C" fn(*const ::std::os::raw::c_char)>,
+    thread_destroy_callback: Option<extern "C" fn()>,
+) {
+    match state {
+        ipccore::EventLoopState::Start => register_thread(thread_create_callback),
+        ipccore::EventLoopState::Stop => unregister_thread(thread_destroy_callback),
+        _ => (),
+    }
+    if matches!(priority, ThreadPriority::RealTime) {
+        thread_local! {
+            static HANDLE: RefCell<Option<audio_thread_priority::RtPriorityHandle>>  = RefCell::new(None);
+        }
+        match state {
+            ipccore::EventLoopState::Active => {
+                HANDLE.with(|h| {
+                    let r = promote_current_thread_to_real_time(256, 48000);
+                    //eprintln!("promote_current_thread_to_real_time={:?}", r);
+                    *h.borrow_mut() = r.ok();
+                });
+            }
+            ipccore::EventLoopState::Idle => {
+                HANDLE.with(|h| {
+                    if let Some(h) = h.borrow_mut().take() {
+                        let r = audio_thread_priority::demote_current_thread_from_real_time(h);
+                        eprintln!("demote_current_thread_from_real_time={:?}", r);
+                    }
+                });
+            }
+            _ => (),
+        }
+    };
+}
+
 fn init_threads(
     thread_create_callback: Option<extern "C" fn(*const ::std::os::raw::c_char)>,
     thread_destroy_callback: Option<extern "C" fn()>,
 ) -> Result<ServerWrapper> {
-    let rpc_name = "AudioIPC Server RPC";
     let rpc_thread =
-        ipccore::EventLoopThread::new(rpc_name.to_string(), None, move |state| match state {
-            ipccore::EventLoopState::Start => {
-                trace!("Starting {} thread", rpc_name);
-                register_thread(thread_create_callback);
-                audioipc::server_platform_init();
-            }
-            ipccore::EventLoopState::Stop => {
-                unregister_thread(thread_destroy_callback);
-                trace!("Stopping {} thread", rpc_name);
-            }
-            _ => (),
+        ipccore::EventLoopThread::new("AudioIPC Server RPC".to_string(), None, move |state| {
+            on_thread_state_change(
+                ThreadPriority::Normal,
+                state,
+                thread_create_callback,
+                thread_destroy_callback,
+            )
         })
         .map_err(|e| {
-            debug!("Failed to start {} thread: {:?}", rpc_name, e);
+            debug!("Failed to start Server RPC thread: {:?}", e);
             e
         })?;
 
-    let callback_name = "AudioIPC Server Callback";
     let callback_thread =
-        ipccore::EventLoopThread::new(callback_name.to_string(), None, move |state| {
-            thread_local! {
-                static HANDLE: RefCell<Option<audio_thread_priority::RtPriorityHandle>>  = RefCell::new(None);
-            }
-            match state {
-                ipccore::EventLoopState::Start => {
-                    trace!("Starting {} thread", callback_name);
-                    HANDLE.with(|h| *h.borrow_mut() = promote_current_thread_to_real_time(256, 48000).ok());
-                    register_thread(thread_create_callback);
-                }
-                ipccore::EventLoopState::Stop => {
-                    unregister_thread(thread_destroy_callback);
-                    trace!("Stopping {} thread", callback_name);
-                }
-                ipccore::EventLoopState::Idle => {
-                    eprintln!("demote");
-                    HANDLE.with(|h|
-                        if let Some(h) = h.borrow_mut().take() {
-                            let _ = audio_thread_priority::demote_current_thread_from_real_time(h);
-                        }
-                    );
-                },
-                ipccore::EventLoopState::Active => {
-                    eprintln!("promote");
-                    HANDLE.with(|h| *h.borrow_mut() = audio_thread_priority::promote_current_thread_to_real_time(256, 48000).ok());
-                },
-            }
+        ipccore::EventLoopThread::new("AudioIPC Server Callback".to_string(), None, move |state| {
+            on_thread_state_change(
+                ThreadPriority::RealTime,
+                state,
+                thread_create_callback,
+                thread_destroy_callback,
+            )
         })
         .map_err(|e| {
-            debug!("Failed to start {} thread: {:?}", callback_name, e);
+            debug!("Failed to start Server Callback thread: {:?}", e);
             e
         })?;
 
-    let device_collection_name = "AudioIPC DeviceCollection RPC";
-    let device_collection_thread =
-        ipccore::EventLoopThread::new(device_collection_name.to_string(), None, move |state| {
-            match state {
-                ipccore::EventLoopState::Start => {
-                    trace!("Starting {} thread", device_collection_name);
-                    register_thread(thread_create_callback);
-                }
-                ipccore::EventLoopState::Stop => {
-                    unregister_thread(thread_destroy_callback);
-                    trace!("Stopping {} thread", device_collection_name);
-                }
-                _ => (),
-            }
-        })
-        .map_err(|e| {
-            debug!("Failed to start {} thread: {:?}", device_collection_name, e);
-            e
-        })?;
+    let device_collection_thread = ipccore::EventLoopThread::new(
+        "AudioIPC DeviceCollection RPC".to_string(),
+        None,
+        move |state| {
+            on_thread_state_change(
+                ThreadPriority::Normal,
+                state,
+                thread_create_callback,
+                thread_destroy_callback,
+            )
+        },
+    )
+    .map_err(|e| {
+        debug!("Failed to start DeviceCollection RPC thread: {:?}", e);
+        e
+    })?;
 
     Ok(ServerWrapper {
         rpc_thread,

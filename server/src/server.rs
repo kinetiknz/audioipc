@@ -174,6 +174,7 @@ where
     CONTEXT_KEY.with(|k| {
         let mut state = k.borrow_mut();
         if state.is_none() {
+            audioipc::server_platform_init();
             *state = Some(CubebContextState {
                 manager: CubebDeviceCollectionManager::new(),
                 context: cubeb_init_from_context_params(),

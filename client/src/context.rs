@@ -20,7 +20,6 @@ use cubeb_backend::{
     capi_new, ffi, Context, ContextOps, DeviceCollectionRef, DeviceId, DeviceType, Error, Ops,
     Result, Stream, StreamParams, StreamParamsRef,
 };
-use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 use std::sync::{Arc, Mutex};
@@ -64,39 +63,6 @@ impl ClientContext {
     #[doc(hidden)]
     pub fn callback_handle(&self) -> &EventLoopHandle {
         self.callback_thread.handle()
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn promote_thread(
-    rpc: &rpccore::Proxy<ServerMessage, ClientMessage>,
-) -> Option<audio_thread_priority::RtPriorityHandle> {
-    match get_current_thread_info() {
-        Ok(info) => {
-            let bytes = info.serialize();
-            // Don't wait for the response, this is on the callback thread, which must not block.
-            rpc.call(ServerMessage::PromoteThreadToRealTime(bytes));
-        }
-        Err(_) => {
-            warn!("Could not remotely promote thread to RT.");
-        }
-    }
-    None
-}
-
-#[cfg(not(target_os = "linux"))]
-fn promote_thread(
-    _rpc: &rpccore::Proxy<ServerMessage, ClientMessage>,
-) -> Option<audio_thread_priority::RtPriorityHandle> {
-    match promote_current_thread_to_real_time(256, 48000) {
-        Ok(handle) => {
-            info!("Audio thread promoted to real-time.");
-            Some(handle)
-        }
-        Err(_) => {
-            warn!("Could not promote thread to real-time.");
-            None
-        }
     }
 }
 
@@ -164,6 +130,65 @@ impl rpccore::Server for DeviceCollectionServer {
         }
     }
 }
+enum ThreadPriority {
+    Normal,
+    RealTime,
+}
+
+fn on_thread_state_change(
+    priority: ThreadPriority,
+    state: ipccore::EventLoopState,
+    thread_create_callback: Option<extern "C" fn(*const ::std::os::raw::c_char)>,
+    thread_destroy_callback: Option<extern "C" fn()>,
+    _rpc: Option<&rpccore::Proxy<ServerMessage, ClientMessage>>,
+) {
+    match state {
+        ipccore::EventLoopState::Start => {
+            register_thread(thread_create_callback);
+            #[cfg(target_os = "linux")]
+            if matches!(priority, ThreadPriority::RealTime) {
+                match get_current_thread_info() {
+                    Ok(info) => {
+                        let bytes = info.serialize();
+                        // Don't wait for the response, this is on the callback thread, which must not block.
+                        _rpc.expect("need rpc proxy")
+                            .call(ServerMessage::PromoteThreadToRealTime(bytes));
+                    }
+                    Err(_) => {
+                        warn!("Could not remotely promote thread to RT.");
+                    }
+                }
+            }
+        }
+        ipccore::EventLoopState::Stop => unregister_thread(thread_destroy_callback),
+        _ => (),
+    }
+    #[cfg(not(target_os = "linux"))]
+    if matches!(priority, ThreadPriority::RealTime) {
+        use std::cell::RefCell;
+        thread_local! {
+            static HANDLE: RefCell<Option<audio_thread_priority::RtPriorityHandle>>  = RefCell::new(None);
+        }
+        match state {
+            ipccore::EventLoopState::Active => {
+                HANDLE.with(|h| {
+                    let r = promote_current_thread_to_real_time(256, 48000);
+                    eprintln!("promote_current_thread_to_real_time={:?}", r);
+                    *h.borrow_mut() = r.ok();
+                });
+            }
+            ipccore::EventLoopState::Idle => {
+                HANDLE.with(|h| {
+                    if let Some(h) = h.borrow_mut().take() {
+                        let r = audio_thread_priority::demote_current_thread_from_real_time(h);
+                        eprintln!("demote_current_thread_from_real_time={:?}", r);
+                    }
+                });
+            }
+            _ => (),
+        }
+    };
+}
 
 impl ContextOps for ClientContext {
     fn init(_context_name: Option<&CStr>) -> Result<Context> {
@@ -178,11 +203,13 @@ impl ContextOps for ClientContext {
 
         let rpc_thread =
             ipccore::EventLoopThread::new("AudioIPC Client RPC".to_string(), None, move |state| {
-                match state {
-                    ipccore::EventLoopState::Start => register_thread(thread_create_callback),
-                    ipccore::EventLoopState::Stop => unregister_thread(thread_destroy_callback),
-                    _ => (),
-                }
+                on_thread_state_change(
+                    ThreadPriority::Normal,
+                    state,
+                    thread_create_callback,
+                    thread_destroy_callback,
+                    None,
+                )
             })
             .map_err(|_| Error::default())?;
         let rpc = rpc_thread
@@ -204,26 +231,13 @@ impl ContextOps for ClientContext {
             "AudioIPC Client Callback".to_string(),
             Some(params.stack_size),
             move |state| {
-                thread_local! {
-                    static HANDLE: RefCell<Option<audio_thread_priority::RtPriorityHandle>>  = RefCell::new(None);
-                }
-                match state {
-                    ipccore::EventLoopState::Start => {
-                        HANDLE.with(|h| *h.borrow_mut() = promote_thread(&rpc2));
-                        register_thread(thread_create_callback);
-                    }
-                    ipccore::EventLoopState::Stop => unregister_thread(thread_destroy_callback),
-                    ipccore::EventLoopState::Idle => {
-                        HANDLE.with(|h|
-                            if let Some(h) = h.borrow_mut().take() {
-                                let _ = audio_thread_priority::demote_current_thread_from_real_time(h);
-                            }
-                        );
-                    },
-                    ipccore::EventLoopState::Active => {
-                        HANDLE.with(|h| *h.borrow_mut() = audio_thread_priority::promote_current_thread_to_real_time(256, 48000).ok());
-                    },
-                }
+                on_thread_state_change(
+                    ThreadPriority::RealTime,
+                    state,
+                    thread_create_callback,
+                    thread_destroy_callback,
+                    Some(&rpc2),
+                )
             },
         )
         .map_err(|_| Error::default())?;

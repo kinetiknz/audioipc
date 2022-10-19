@@ -165,12 +165,8 @@ impl EventLoop {
         Ok(eventloop)
     }
 
-    fn get_state(&self) -> EventLoopState {
-        if self.connections.is_empty() {
-            EventLoopState::Idle
-        } else {
-            EventLoopState::Active
-        }
+    fn is_active(&self) -> bool {
+        self.connections.len() > 0
     }
 
     // Return a cloneable handle for controlling the EventLoop externally.
@@ -203,7 +199,7 @@ impl EventLoop {
     // Returns false if EventLoop is shutting down.
     // Each step may call `handle_event` on any registered connection that
     // has received readiness events from the poll wakeup.
-    fn poll(&mut self) -> Result<bool> {
+    fn poll(&mut self) -> Result<()> {
         loop {
             let r = self.poll.poll(&mut self.events, None);
             match r {
@@ -212,7 +208,10 @@ impl EventLoop {
                 Err(e) => return Err(e),
             }
         }
+        Ok(())
+    }
 
+    fn handle_events(&mut self) -> Result<bool> {
         for event in self.events.iter() {
             match event.token() {
                 WAKE_TOKEN => {
@@ -677,7 +676,7 @@ impl<T: Handler> FramedDriver<T> {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum EventLoopState {
     Start,
     Stop,
@@ -705,15 +704,22 @@ impl EventLoopThread {
             .stack_size(stack_size.unwrap_or(64 * 4096));
 
         let thread = builder.spawn(move || {
-            trace!("{}: event loop thread enter", event_loop.name);
+            trace!("{}: event loop state Start", event_loop.name);
             on_state_change(EventLoopState::Start);
-            let _thread_exit_guard =
-                scopeguard::guard((), |_| on_state_change(EventLoopState::Stop));
+            let mut event_loop = scopeguard::guard(event_loop, |event_loop| {
+                trace!("{}: event loop state Stop", event_loop.name);
+                on_state_change(EventLoopState::Stop);
+            });
 
-            let mut last_state = EventLoopState::Active;
+            let mut last_state = EventLoopState::Start;
             let r = loop {
-                let state = event_loop.get_state();
+                let state = if event_loop.is_active() {
+                    EventLoopState::Active
+                } else {
+                    EventLoopState::Idle
+                };
                 if state != last_state {
+                    trace!("{}: event loop state {:?}", event_loop.name, state);
                     on_state_change(state);
                     last_state = state;
                 }
@@ -726,12 +732,24 @@ impl EventLoopThread {
                     start.elapsed().as_micros()
                 );
                 match r {
-                    Ok(true) => continue,
+                    Ok(()) => (),
                     _ => break r,
-                }
+                };
+                let start = std::time::Instant::now();
+                let r = event_loop.handle_events();
+                trace!(
+                    "{}: event loop handle_events r={:?}, took={}μs",
+                    event_loop.name,
+                    r,
+                    start.elapsed().as_micros()
+                );
+                match r {
+                    Ok(true) => continue,
+                    _ => break r.map(|_| ()),
+                };
             };
 
-            trace!("{}: event loop thread exit", event_loop.name);
+            trace!("{}: event loop thread stop", event_loop.name);
             r.map(|_| ())
         })?;
 
