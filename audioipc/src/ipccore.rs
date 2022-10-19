@@ -166,7 +166,7 @@ impl EventLoop {
     }
 
     fn is_active(&self) -> bool {
-        self.connections.len() > 0
+        !self.connections.is_empty()
     }
 
     // Return a cloneable handle for controlling the EventLoop externally.
