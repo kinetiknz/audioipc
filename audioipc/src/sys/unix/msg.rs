@@ -51,6 +51,7 @@ pub(crate) fn recv_msg_with_flags(
 
     let n = cvt_r(|| unsafe { libc::recvmsg(socket, &mut msghdr as *mut _, flags) })?;
 
+    #[cfg_attr(feature = "cargo-clippy", allow(clippy::unnecessary_cast))]
     let controllen = msghdr.msg_controllen as usize;
     Ok((n, controllen, msghdr.msg_flags))
 }
