@@ -154,6 +154,8 @@ pub struct Proxy<Request, Response> {
 
 impl<Request, Response> Proxy<Request, Response> {
     fn new(requests: Weak<RequestQueue<Request, Response>>) -> Self {
+        let req = requests.upgrade().expect("can't fail during setup");
+        req.attach_proxy();
         Self {
             handle: None,
             requests: ManuallyDrop::new(requests),
@@ -343,7 +345,6 @@ pub(crate) fn make_client<C: Client>(
     let proxy_req = Arc::downgrade(&requests);
     let handler = ClientHandler::new(requests);
     let proxy = Proxy::new(proxy_req);
-    handler.requests.attach_proxy();
     Ok((handler, proxy))
 }
 
