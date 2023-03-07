@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use std::io::{self, Error, ErrorKind, Result};
 use std::marker::PhantomPinned;
 use std::mem::ManuallyDrop;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 use crate::ipccore::EventLoopHandle;
@@ -149,11 +149,11 @@ type ProxyRequest<Request, Response> = (Request, CompletionWriter<Response>);
 #[derive(Debug)]
 pub struct Proxy<Request, Response> {
     handle: Option<(EventLoopHandle, Token)>,
-    requests: ManuallyDrop<Weak<ArrayQueue<ProxyRequest<Request, Response>>>>,
+    requests: ManuallyDrop<Weak<RequestQueue<Request, Response>>>,
 }
 
 impl<Request, Response> Proxy<Request, Response> {
-    fn new(requests: Weak<ArrayQueue<ProxyRequest<Request, Response>>>) -> Self {
+    fn new(requests: Weak<RequestQueue<Request, Response>>) -> Self {
         Self {
             handle: None,
             requests: ManuallyDrop::new(requests),
@@ -211,12 +211,14 @@ impl<Request, Response> Drop for Proxy<Request, Response> {
         // Must drop `requests` before waking the connection, otherwise
         // the wake may be processed before the (last) weak reference is
         // dropped.
-        let last_proxy = Weak::weak_count(&self.requests);
-        unsafe {
-            ManuallyDrop::drop(&mut self.requests);
-        }
-        if last_proxy == 1 && self.handle.is_some() {
-            self.wake_connection()
+        if let Some(req) = self.requests.upgrade() {
+            let last = req.detach_proxy();
+            unsafe {
+                ManuallyDrop::drop(&mut self.requests);
+            }
+            if last && self.handle.is_some() {
+                self.wake_connection()
+            }
         }
     }
 }
@@ -232,13 +234,11 @@ const RPC_CLIENT_INITIAL_PROXIES: usize = 32; // Initial proxy pre-allocation pe
 // connected to a ProxyResponse.
 pub(crate) struct ClientHandler<C: Client> {
     in_flight: VecDeque<CompletionWriter<C::ClientMessage>>,
-    requests: Arc<ArrayQueue<ProxyRequest<C::ServerMessage, C::ClientMessage>>>,
+    requests: Arc<RequestQueue<C::ServerMessage, C::ClientMessage>>,
 }
 
 impl<C: Client> ClientHandler<C> {
-    fn new(
-        requests: Arc<ArrayQueue<ProxyRequest<C::ServerMessage, C::ClientMessage>>>,
-    ) -> ClientHandler<C> {
+    fn new(requests: Arc<RequestQueue<C::ServerMessage, C::ClientMessage>>) -> ClientHandler<C> {
         ClientHandler::<C> {
             in_flight: VecDeque::with_capacity(RPC_CLIENT_INITIAL_PROXIES),
             requests,
@@ -267,7 +267,7 @@ impl<C: Client> Handler for ClientHandler<C> {
         // If the weak count is zero, no proxies are attached and
         // no further proxies can be attached since every proxy
         // after the initial one is cloned from an existing instance.
-        if Arc::weak_count(&self.requests) == 0 {
+        if self.requests.proxies_connected.load(Ordering::Relaxed) == 0 {
             return Err(io::ErrorKind::ConnectionAborted.into());
         }
         // Try to get a new message
@@ -285,14 +285,66 @@ impl<C: Client> Handler for ClientHandler<C> {
     }
 }
 
+// This happens too late, needs to be set as soon as decision to never call produce() again happens
+impl<C: Client> Drop for ClientHandler<C> {
+    fn drop(&mut self) {
+        self.requests
+            .server_connected
+            .store(false, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug)]
+struct RequestQueue<Request, Response> {
+    requests: ArrayQueue<ProxyRequest<Request, Response>>,
+    server_connected: AtomicBool,
+    proxies_connected: AtomicUsize,
+}
+
+impl<Request, Response> RequestQueue<Request, Response> {
+    fn new() -> Self {
+        RequestQueue {
+            requests: ArrayQueue::new(RPC_CLIENT_INITIAL_PROXIES),
+            server_connected: AtomicBool::new(true),
+            proxies_connected: AtomicUsize::new(0),
+        }
+    }
+
+    fn push(&self, request: ProxyRequest<Request, Response>) -> Result<()> {
+        if self.requests.push(request).is_err() {
+            return Err(Error::new(ErrorKind::Other, "queue full"));
+        }
+        if !self.server_connected.load(Ordering::Relaxed) {
+            return Err(Error::new(ErrorKind::Other, "server not connected"));
+        }
+        Ok(())
+    }
+
+    fn pop(&self) -> Option<ProxyRequest<Request, Response>> {
+        self.requests.pop()
+    }
+
+    fn attach_proxy(&self) {
+        assert!(self.server_connected.load(Ordering::Relaxed));
+        self.proxies_connected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn detach_proxy(&self) -> bool {
+        let old = self.proxies_connected.fetch_sub(1, Ordering::Relaxed);
+        assert!(old != 0);
+        old == 1
+    }
+}
+
 #[allow(clippy::type_complexity)]
 pub(crate) fn make_client<C: Client>(
 ) -> Result<(ClientHandler<C>, Proxy<C::ServerMessage, C::ClientMessage>)> {
-    let requests = Arc::new(ArrayQueue::new(RPC_CLIENT_INITIAL_PROXIES));
+    let requests = Arc::new(RequestQueue::new());
     let proxy_req = Arc::downgrade(&requests);
     let handler = ClientHandler::new(requests);
-
-    Ok((handler, Proxy::new(proxy_req)))
+    let proxy = Proxy::new(proxy_req);
+    handler.requests.attach_proxy();
+    Ok((handler, proxy))
 }
 
 // Server-specific Handler implementation.
