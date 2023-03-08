@@ -154,8 +154,12 @@ pub struct Proxy<Request, Response> {
 
 impl<Request, Response> Proxy<Request, Response> {
     fn new(requests: Weak<RequestQueue<Request, Response>>) -> Self {
-        let req = requests.upgrade().expect("can't fail during setup");
-        req.attach_proxy();
+        if let Some(req) = requests.upgrade() {
+            // Handles case of cloning a disconnected/dead proxy
+            // Since upgrade failed here, it will also fail
+            // for any subsequent call() to this new dead proxy.
+            req.attach_proxy();
+        }
         Self {
             handle: None,
             requests: ManuallyDrop::new(requests),
@@ -316,9 +320,10 @@ impl<Request, Response> RequestQueue<Request, Response> {
         if self.requests.push(request).is_err() {
             return Err(Error::new(ErrorKind::Other, "queue full"));
         }
-        if !self.server_connected.load(Ordering::Relaxed) {
-            return Err(Error::new(ErrorKind::Other, "server not connected"));
-        }
+        // XXX need to remove request or force a wait
+        // if !self.server_connected.load(Ordering::Relaxed) {
+        //     return Err(Error::new(ErrorKind::Other, "server not connected"));
+        // }
         Ok(())
     }
 
@@ -327,7 +332,8 @@ impl<Request, Response> RequestQueue<Request, Response> {
     }
 
     fn attach_proxy(&self) {
-        assert!(self.server_connected.load(Ordering::Relaxed));
+        // attaching to a disconnected server is ok - call() will fail
+        //assert!(self.server_connected.load(Ordering::Relaxed));
         self.proxies_connected.fetch_add(1, Ordering::Relaxed);
     }
 
