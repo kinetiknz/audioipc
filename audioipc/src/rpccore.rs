@@ -167,17 +167,19 @@ impl<Request, Response> Proxy<Request, Response> {
     }
 
     pub fn call(&self, request: Request) -> Result<Response> {
-        let req = if let Some(req) = self.requests.upgrade() {
-            req
-        } else {
-            debug!("Proxy[{:p}]: call failed - CH::requests dropped", self);
-            return Err(Error::new(ErrorKind::Other, "proxy send error"));
-        };
         let response = Completion::new();
-        let response_writer = response.writer();
-        if req.push((request, response_writer)).is_err() {
-            debug!("Proxy[{:p}]: call failed - CH::requests full", self);
-            return Err(Error::new(ErrorKind::Other, "proxy send error"));
+        {
+            let req = if let Some(req) = self.requests.upgrade() {
+                req
+            } else {
+                debug!("Proxy[{:p}]: call failed - CH::requests dropped", self);
+                return Err(Error::new(ErrorKind::Other, "proxy send error"));
+            };
+            let response_writer = response.writer();
+            if req.push((request, response_writer)).is_err() {
+                debug!("Proxy[{:p}]: call failed - CH::requests full", self);
+                return Err(Error::new(ErrorKind::Other, "proxy send error"));
+            }
         }
         self.wake_connection();
         match response.wait() {
